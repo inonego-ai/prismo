@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            agent/package-lock.json
+            desktop/package-lock.json
+            renderer/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Install dependencies
+        run: |
+          npm ci --prefix agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --prefix desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --prefix renderer
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test Agent
+        working-directory: agent
+        run: npm test
+      - name: Test Windows app
+        working-directory: desktop
+        run: npm test
+      - name: Test renderer
+        working-directory: renderer
+        run: npm test
+      - name: Test and build Android app
+        working-directory: android
+        run: .\gradlew.bat :app:testDebugUnitTest :app:assembleDebug --console=plain
+      - name: Upload debug APK
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: prismo-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - name: Stop Gradle before saving caches
+        if: always()
+        working-directory: android
+        run: .\gradlew.bat --stop

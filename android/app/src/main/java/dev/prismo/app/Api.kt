@@ -19,15 +19,11 @@ data class PairResponse(val token: String)
 data class AppUpdate(val packageName: String, val versionCode: Long,
                      val versionName: String, val size: Long, val sha256: String)
 data class AppUpdateResponse(val configured: Boolean, val update: AppUpdate?)
-data class RepoSummary(
-    val id: String, val name: String, val available: Boolean,
-    val issue: String?, val branch: String?, val changeCount: Int
-)
+data class RepoSummary(val id: String, val name: String)
 data class RepoList(val repositories: List<RepoSummary>)
 data class Change(
     val path: String, val previousPath: String? = null,
-    val staged: Boolean, val unstaged: Boolean,
-    val untracked: Boolean, val kind: String
+    val stagedKind: String?, val workingKind: String?
 )
 data class RepoStatus(val branch: String, val head: String?, val changes: List<Change>)
 data class TreeEntry(val name: String, val path: String, val directory: Boolean)
@@ -53,9 +49,14 @@ interface PrismoAPI {
     @GET("api/v1/repositories/{id}/file")
     suspend fun file(@Path("id") id: String, @Query("path") path: String,
                      @Query("revision") revision: String? = null): FileData
+    @Streaming
+    @GET("api/v1/repositories/{id}/image")
+    suspend fun image(@Path("id") id: String, @Query("path") path: String,
+                      @Query("revision") revision: String? = null,
+                      @Query("commit") commit: String? = null): ResponseBody
     @GET("api/v1/repositories/{id}/diff")
     suspend fun diff(@Path("id") id: String, @Query("scope") scope: String,
-                     @Query("path") path: String): DiffData
+                     @Query("path") path: String, @Query("full") full: Boolean): DiffData
     @GET("api/v1/repositories/{id}/commits")
     suspend fun commits(@Path("id") id: String,
                         @Query("cursor") cursor: String? = null): CommitList
@@ -66,7 +67,7 @@ interface PrismoAPI {
                            @Query("path") path: String): FileData
     @GET("api/v1/repositories/{id}/commits/{hash}/diff")
     suspend fun commitDiff(@Path("id") id: String, @Path("hash") hash: String,
-                           @Query("path") path: String): DiffData
+                           @Query("path") path: String, @Query("full") full: Boolean): DiffData
 }
 object PrismoClient {
     private val http = OkHttpClient.Builder()

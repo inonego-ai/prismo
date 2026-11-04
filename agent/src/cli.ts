@@ -15,7 +15,8 @@ async function run() {
     case "add":
       present({ added: true, repository: await addRepository(value ?? ".") }); break;
     case "remove":
-      present({ removed: await removeRepository(value ?? ".") }); break;
+      if (!value) throw Error("Repository ID is required");
+      present({ removed: await removeRepository(value) }); break;
     case "list":
       present({ repositories: await listRepositories() }); break;
     case "status": {
@@ -35,7 +36,7 @@ async function run() {
     default:
       present("Prismo CLI\n" +
         "  prismo add [path] [--json]\n" +
-        "  prismo remove [path-or-id] [--json]\n" +
+        "  prismo remove <id> [--json]\n" +
         "  prismo list [--json]\n" +
         "  prismo status [--json]\n" +
         "  기기 연결 QR은 PC 앱에서만 생성할 수 있습니다.");

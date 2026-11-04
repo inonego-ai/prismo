@@ -5,9 +5,8 @@ const root = resolve(import.meta.dirname, "..");
 const bundles = [
   ["diff2html", "MIT", "LICENSE.md", "https://github.com/rtfpessoa/diff2html"],
   ["highlight.js", "BSD-3-Clause", "LICENSE", "https://github.com/highlightjs/highlight.js"],
-  ["diff", "BSD-3-Clause", "LICENSE", "https://github.com/kpdecker/jsdiff"],
-  ["@profoundlogic/hogan", "Apache-2.0", "LICENSE", "https://github.com/ProfoundLogic/hogan.js-ProfoundLogic"],
-  ["dompurify", "(MPL-2.0 OR Apache-2.0)", "LICENSE", "https://github.com/cure53/DOMPurify"]
+  ["dompurify", "(MPL-2.0 OR Apache-2.0)", "LICENSE", "https://github.com/cure53/DOMPurify"],
+  ["marked", "MIT", "LICENSE.md", "https://github.com/markedjs/marked"]
 ];
 const meta = JSON.parse(await readFile(resolve(root, "build/renderer-meta.json"), "utf8"));
 const packaged = new Set(Object.keys(meta.inputs).map(path =>

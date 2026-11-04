@@ -1,3 +1,6 @@
 {
-  "github": null
+  "github": {
+    "owner": "inonego-ai",
+    "repo": "prismo"
+  }
 }

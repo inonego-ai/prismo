@@ -1,14 +1,14 @@
-import { html } from "diff2html";
+import { renderCodeView, renderDiffView } from "./diff-view.js";
+import { marked } from "marked";
 import hljs from "highlight.js/lib/common";
 import DOMPurify from "dompurify";
 import { normalizeGitDiffPaths } from "./git-diff-paths.js";
-import "diff2html/bundles/css/diff2html.min.css";
 import "highlight.js/styles/github-dark.css";
 import "./style.css";
 
-type Mode = "diff" | "file" | "raw";
+type Mode = "diff" | "file" | "raw" | "markdown";
 type Options = {
-  fontSize: number; lineHeight: number; padding: number;
+  fontSize: number; markdownFontSize: number; lineHeight: number; padding: number;
   wrap: boolean; numbers: boolean; split: boolean; dark: boolean;
 };
 type Payload = { mode: Mode; content: string; path: string; options: Options };
@@ -37,6 +37,7 @@ function paint(code: HTMLElement, language?: string) {
 }
 function applyOptions(options: Options) {
   document.documentElement.style.setProperty("--code-font", options.fontSize + "px");
+  document.documentElement.style.setProperty("--markdown-font", options.markdownFontSize + "px");
   document.documentElement.style.setProperty("--code-height", String(options.lineHeight));
   document.documentElement.style.setProperty("--code-pad", options.padding + "px");
   document.documentElement.classList.toggle("wrap", options.wrap);
@@ -46,28 +47,40 @@ function applyOptions(options: Options) {
 function render(input: string) {
   const data = JSON.parse(input) as Payload;
   applyOptions(data.options);
+  root.classList.toggle("markdown-preview", data.mode === "markdown");
   root.replaceChildren();
   if (!data.content) {
     root.textContent = data.mode === "diff" ? "변경 내용 없음" : "빈 파일";
     return;
   }
-  if (data.mode === "diff") {
-    const diffMarkup = html(normalizeGitDiffPaths(data.content), {
-      drawFileList: false,
-      matching: "lines",
-      outputFormat: data.options.split ? "side-by-side" : "line-by-line"
+  if (data.mode === "markdown") {
+    root.innerHTML = DOMPurify.sanitize(marked.parse(data.content, { async: false }) as string, {
+      USE_PROFILES: { html: true },
+      FORBID_TAGS: ["img", "iframe", "object", "embed", "form", "video", "audio"]
     });
-    root.innerHTML = DOMPurify.sanitize(diffMarkup, { USE_PROFILES: { html: true } });
-    const language = lang(data.path);
-    root.querySelectorAll<HTMLElement>(".d2h-code-line-ctn").forEach(code => paint(code, language));
+    root.querySelectorAll<HTMLAnchorElement>("a").forEach(link => {
+      link.removeAttribute("target");
+      link.removeAttribute("download");
+    });
     return;
   }
-  const pre = document.createElement("pre");
-  pre.className = data.mode === "raw" ? "raw" : "source";
-  const code = document.createElement("code");
-  code.textContent = data.content;
-  pre.appendChild(code);
-  root.appendChild(pre);
-  if (data.mode === "file") paint(code, lang(data.path));
+  if (data.mode === "diff") {
+    renderDiffView(root, normalizeGitDiffPaths(data.content), data.options.split);
+  } else if (data.mode === "file") {
+    renderCodeView(root, data.content);
+  } else {
+    const pre = document.createElement("pre");
+    pre.className = "raw";
+    const code = document.createElement("code");
+    code.textContent = data.content;
+    pre.appendChild(code);
+    root.appendChild(pre);
+  }
+  // Both views use the same source-line element and baseline.
+  // Limit per-line grammar work on large files to keep the WebView responsive.
+  if (data.mode !== "raw" && data.content.length < 80_000) {
+    const language = lang(data.path);
+    root.querySelectorAll<HTMLElement>(".render-code").forEach(code => paint(code, language));
+  }
 }
 (window as typeof window & { Prismo: { render: (input: string) => void } }).Prismo = { render };

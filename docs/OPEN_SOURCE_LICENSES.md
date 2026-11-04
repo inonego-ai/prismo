@@ -1,12 +1,12 @@
 # Prismo — 오픈소스 및 외부 SDK 라이선스 관리
 
-> 2026-11-04 기준. 현재 잠금 파일과 Android 빌드 구성을 확인한 결과이며 법률 자문은 아니다.
+> 2026-11-05 기준. 현재 잠금 파일과 Android 빌드 구성을 확인한 결과이며 법률 자문은 아니다.
 > 이 문서는 프로젝트 배포에 필요한 라이선스 정보와 확인 범위를 기록한다.
 
 ## 1. 배포 구성에 따라 구분
 
 - **Android APK에 포함:** AndroidX/Compose, Kotlin 런타임, Retrofit/OkHttp 등의 Maven 구성요소와
-  WebView용 JavaScript 번들(diff2html, highlight.js 및 하위 라이브러리).
+  WebView용 JavaScript 번들(diff2html 파서, highlight.js, DOMPurify, marked).
 - **Windows PC 프로그램에서 사용:** Fastify, qrcode, Electron, Lucide SVG 아이콘 등. 이들을 설치하거나
   PC Agent를 번들 배포하는 경우 해당 패키지들의 라이선스 고지를 지켜야 한다.
 - **외부 설치 도구:** Git CLI(GPL), Tailscale(BSD-3-Clause 코드 및 서비스 약관), Node.js, Android SDK,
@@ -19,11 +19,10 @@
 | --- | --- | --- | --- |
 | diff2html | 3.4.56 | MIT | https://github.com/rtfpessoa/diff2html |
 | highlight.js | 11.12.0 | BSD-3-Clause | https://github.com/highlightjs/highlight.js |
-| diff (jsdiff) | 8.0.4 | BSD-3-Clause | https://github.com/kpdecker/jsdiff |
-| @profoundlogic/hogan | 3.0.4 | Apache-2.0 | https://github.com/ProfoundLogic/hogan.js-ProfoundLogic |
 | DOMPurify | 3.4.17 | MPL-2.0 OR Apache-2.0 (Apache-2.0 고지 수록) | https://github.com/cure53/DOMPurify |
+| marked | 15.0.12 | MIT | https://github.com/markedjs/marked |
 
-- 위 **다섯 패키지는 esbuild 실제 번들 입력 메타파일**과 npm 설치 패키지에서 확인했다.
+- 위 **네 패키지는 esbuild 실제 번들 입력 메타파일**과 npm 설치 패키지에서 확인했다. diff2html은 Git 패치 파서만 번들에 포함하며, 사용하지 않는 HTML 템플릿 엔진은 제외한다.
 - 라이선스 **원문과 저작권 고지**는 npm 패키지의 LICENSE 파일을 그대로 이용해
   [RENDERER_THIRD_PARTY_NOTICES.txt](RENDERER_THIRD_PARTY_NOTICES.txt)에 저장한다.
 - renderer 빌드(`npm run build`)가 라이선스 검사/복사까지 수행하고,

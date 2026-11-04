@@ -1,11 +1,18 @@
 package dev.prismo.app
 
-import android.app.Activity
 import android.net.Uri
 import android.os.Bundle
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -15,7 +22,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Difference
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Settings
@@ -33,6 +42,8 @@ import androidx.compose.ui.unit.sp
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.flow.map
 import java.net.URI
 import retrofit2.HttpException
@@ -69,6 +80,7 @@ private sealed interface UpdateState {
 private sealed interface ReaderResult {
     data object Loading : ReaderResult
     data class Content(val text: String) : ReaderResult
+    data class Picture(val bitmap: Bitmap) : ReaderResult
     data object Missing : ReaderResult
     data object Failed : ReaderResult
 }
@@ -195,12 +207,37 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
                            onPrefs: ((ViewerPreferences) -> ViewerPreferences) -> Unit) {
     var repos by remember { mutableStateOf<List<RepoSummary>>(emptyList()) }
     var initialLoad by remember { mutableStateOf(true) }
-    var selectedID by remember { mutableStateOf<String?>(null) }
-    var folder by remember(selectedID) { mutableStateOf("") }
-    var tab by remember { mutableStateOf(Tab.Changes) }
-    var showingSettings by remember { mutableStateOf(false) }
-    var target by remember { mutableStateOf<ReaderTarget?>(null) }
-    var refresh by remember { mutableIntStateOf(0) }
+    var selectedID by rememberSaveable { mutableStateOf<String?>(null) }
+    var tabName by rememberSaveable { mutableStateOf(Tab.Changes.name) }
+    val tab = Tab.valueOf(tabName)
+    var showingSettings by rememberSaveable { mutableStateOf(false) }
+    var targetPath by rememberSaveable { mutableStateOf<String?>(null) }
+    var targetScope by rememberSaveable { mutableStateOf<String?>(null) }
+    var targetCommit by rememberSaveable { mutableStateOf<String?>(null) }
+    val target = targetPath?.let { ReaderTarget(it, targetScope, targetCommit) }
+    var refresh by rememberSaveable { mutableIntStateOf(0) }
+    val changesScroll = androidx.compose.foundation.lazy.rememberLazyListState()
+    val filesScroll = androidx.compose.foundation.lazy.rememberLazyListState()
+    var collapsedChanges by rememberSaveable(selectedID) { mutableStateOf(emptyList<String>()) }
+    var expandedFiles by rememberSaveable(selectedID) { mutableStateOf(emptyList<String>()) }
+    fun toggleChangeFolder(path: String) {
+        collapsedChanges = if (path in collapsedChanges) collapsedChanges - path
+            else collapsedChanges + path
+    }
+    fun toggleFileFolder(path: String) {
+        expandedFiles = if (path in expandedFiles) expandedFiles - path
+            else expandedFiles + path
+    }
+    fun openReader(path: String, scope: String? = null, commit: String? = null) {
+        targetPath = path
+        targetScope = scope
+        targetCommit = commit
+    }
+    fun closeReader() {
+        targetPath = null
+        targetScope = null
+        targetCommit = null
+    }
     var error by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(api, refresh) {
         try {
@@ -208,7 +245,7 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
             repos = loaded
             if (selectedID != null && loaded.none { it.id == selectedID }) {
                 selectedID = null
-                target = null
+                closeReader()
             }
             error = null
         } catch (e: CancellationException) { throw e }
@@ -216,20 +253,19 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
             if (e.code() == 401) {
                 repos = emptyList()
                 selectedID = null
-                target = null
+                closeReader()
                 onPrefs { it.copy(pcURL = "", deviceToken = "") }
             } else error = "저장소를 불러올 수 없습니다."
         } catch (_: Exception) {
             error = "PC에 연결할 수 없습니다."
         } finally { initialLoad = false }
     }
-    val activeTarget = target
     val activeRepo = repos.find { it.id == selectedID }
-    BackHandler(enabled = activeTarget != null || showingSettings || activeRepo != null) {
+    BackHandler(enabled = target != null || showingSettings || activeRepo != null) {
         when {
-            activeTarget != null -> target = null
+            target != null -> closeReader()
             showingSettings -> showingSettings = false
-            activeRepo != null -> { selectedID = null; target = null }
+            activeRepo != null -> { selectedID = null; closeReader() }
         }
     }
     if (initialLoad) {
@@ -238,8 +274,8 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
         }
         return
     }
-    if (activeRepo != null && activeTarget != null) {
-        ReaderPage(api, activeRepo.id, activeTarget, prefs, onBack = { target = null })
+    if (activeRepo != null && target != null) {
+        ReaderPage(api, activeRepo.id, target, prefs, onBack = { closeReader() })
         return
     }
     Scaffold(
@@ -253,7 +289,7 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
                 navigationIcon = {
                     if (showingSettings) TextButton(onClick = { showingSettings = false }) {
                         Text("‹")
-                    } else if (activeRepo != null) TextButton(onClick = { selectedID = null; target = null }) {
+                    } else if (activeRepo != null) TextButton(onClick = { selectedID = null; closeReader() }) {
                         Text("‹ PC")
                     }
                 },
@@ -272,7 +308,7 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
                 Tab.entries.forEach { item ->
                     NavigationBarItem(
                         selected = tab == item,
-                        onClick = { tab = item },
+                        onClick = { tabName = item.name },
                         icon = { Icon(item.icon, contentDescription = null) },
                         label = { Text(item.title, fontSize = 11.sp) }
                     )
@@ -285,21 +321,22 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
             if (showingSettings) {
                 SettingsPage(api, prefs, onPrefs)
             } else if (activeRepo == null) {
-                RepoListPage(repos, prefs.pcURL) { repo ->
+                RepoListPage(api, repos, prefs.pcURL) { repo ->
                     selectedID = repo.id
-                    target = null
-                    tab = Tab.Changes
+                    closeReader()
+                    tabName = Tab.Changes.name
                 }
             } else when (tab) {
-                Tab.Changes -> ChangesPage(api, activeRepo.id, refresh) { path, scope ->
-                    target = ReaderTarget(path, scope)
+                Tab.Changes -> ChangesPage(api, activeRepo.id, refresh,
+                    changesScroll, collapsedChanges, ::toggleChangeFolder) { path, scope ->
+                    openReader(path, scope)
                 }
-                Tab.Files -> FilesPage(api, activeRepo.id, refresh, folder,
-                    onFolder = { folder = it }) { path ->
-                    target = ReaderTarget(path)
+                Tab.Files -> GitFilesTree(api, activeRepo.id, refresh,
+                    filesScroll, expandedFiles, ::toggleFileFolder) { path ->
+                    openReader(path)
                 }
                 Tab.History -> HistoryPage(api, activeRepo.id, refresh) { path, hash ->
-                    target = ReaderTarget(path, commit = hash)
+                    openReader(path, commit = hash)
                 }
             }
         }
@@ -314,25 +351,46 @@ private fun ErrorText(error: String?) {
     )
 }
 @Composable
-private fun RepoListPage(repos: List<RepoSummary>, url: String, open: (RepoSummary) -> Unit) {
+private fun RepoListPage(
+    api: PrismoAPI, repos: List<RepoSummary>, url: String, open: (RepoSummary) -> Unit
+) {
+    val statuses = remember(api) { mutableStateMapOf<String, RepoStatus>() }
+    val unavailable = remember(api) { mutableStateMapOf<String, Boolean>() }
+    val slots = remember(api) { Semaphore(2) }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Text("PC", fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(Uri.parse(url).host.orEmpty(), fontWeight = FontWeight.SemiBold)
+        val device = Uri.parse(url).host.orEmpty().substringBefore(".")
+        Text(device.ifBlank { "PC" }, fontWeight = FontWeight.SemiBold)
+
         Spacer(Modifier.height(16.dp))
         Text("저장소", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(repos, key = { it.id }) { repo ->
-                ElevatedCard(onClick = { if (repo.available) open(repo) },
+                LaunchedEffect(api, repo.id) {
+                    if (!statuses.containsKey(repo.id) && !unavailable.containsKey(repo.id)) {
+                        try {
+                            statuses[repo.id] = slots.withPermit { api.status(repo.id) }
+                        } catch (exception: CancellationException) {
+                            throw exception
+                        } catch (_: Exception) {
+                            unavailable[repo.id] = true
+                        }
+                    }
+                }
+                ElevatedCard(onClick = { open(repo) },
                     modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(14.dp)) {
                         Text(repo.name, fontWeight = FontWeight.SemiBold)
-                        Text(if (repo.available)
-                            (repo.branch ?: "") + "  •  변경 " + repo.changeCount + "개"
-                            else if (repo.issue == "temporary") "일시적으로 상태를 조회할 수 없음"
-                            else "접근할 수 없음",
-                            style = MaterialTheme.typography.bodySmall,
+                        Text(when {
+                            statuses[repo.id] != null -> {
+                                val status = requireNotNull(statuses[repo.id])
+                                status.branch + "  •  변경 " + status.changes.size + "개"
+                            }
+                            unavailable[repo.id] == true -> "상태 조회 불가"
+                            else -> "상태 확인 중"
+                        }, style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
@@ -341,130 +399,30 @@ private fun RepoListPage(repos: List<RepoSummary>, url: String, open: (RepoSumma
     }
 }
 @Composable
-private fun ChangesPage(api: PrismoAPI, id: String, refresh: Int,
-                        open: (String, String?) -> Unit) {
+private fun ChangesPage(
+    api: PrismoAPI, id: String, refresh: Int,
+    scroll: androidx.compose.foundation.lazy.LazyListState,
+    collapsed: List<String>, onToggle: (String) -> Unit,
+    open: (String, String?) -> Unit
+) {
     var status by remember(id) { mutableStateOf<RepoStatus?>(null) }
     var error by remember(id) { mutableStateOf<String?>(null) }
     LaunchedEffect(api, id, refresh) {
         error = null
-        try { status = api.status(id) }
-        catch (e: CancellationException) { throw e }
-        catch (_: Exception) {
+        try {
+            status = api.status(id)
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (_: Exception) {
             error = "변경 목록을 불러올 수 없습니다."
         }
     }
-    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        Text("브랜치  " + (status?.branch ?: "—"),
-            style = MaterialTheme.typography.titleMedium)
-        Text("변경 파일 " + (status?.changes?.size ?: 0) + "개",
-            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Column(Modifier.fillMaxSize()) {
         ErrorText(error)
-        if (status == null && error == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-        LazyColumn {
-            items(status?.changes.orEmpty(), key = { it.path }) { change ->
-                HorizontalDivider()
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)
-                        .clickable { open(change.path, when {
-                            change.kind == "conflicted" -> null
-                            change.untracked -> "untracked"
-                            change.unstaged -> "unstaged"
-                            else -> "staged"
-                        }) }.padding(vertical = 9.dp)) {
-                        Text(change.path, fontSize = 13.sp, maxLines = 2,
-                            overflow = TextOverflow.Ellipsis)
-                        Text(if (change.kind == "conflicted") "충돌 · 작업 파일 열기" else change.kind,
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    if (change.staged) TextButton(onClick = { open(change.path, "staged") }) {
-                        Text("S", fontSize = 12.sp)
-                    }
-                    if (change.unstaged) TextButton(onClick = { open(change.path, "unstaged") }) {
-                        Text("W", fontSize = 12.sp)
-                    }
-                    if (change.untracked) TextButton(onClick = { open(change.path, "untracked") }) {
-                        Text("U", fontSize = 12.sp)
-                    }
-                }
-            }
-        }
-    }
-}
-@Composable
-private fun FilesPage(api: PrismoAPI, id: String, refresh: Int, folder: String,
-                      onFolder: (String) -> Unit, open: (String) -> Unit) {
-    var entries by remember(id, folder) { mutableStateOf<List<TreeEntry>>(emptyList()) }
-    var cursor by remember(id, folder) { mutableStateOf<String?>(null) }
-    var nextCursor by remember(id, folder) { mutableStateOf<String?>(null) }
-    var loading by remember(id, folder) { mutableStateOf(false) }
-    var error by remember(id, folder) { mutableStateOf<String?>(null) }
-    var reload by remember(id, folder) { mutableIntStateOf(0) }
-    var pageRequestId by remember(id, folder) { mutableIntStateOf(0) }
-    var loadedRefresh by remember(id, folder) { mutableIntStateOf(refresh) }
-    LaunchedEffect(api, id, folder, refresh, reload, pageRequestId) {
-        loading = true
-        error = null
-        val requestCursor = requestPageCursor(refresh, loadedRefresh, cursor)
-        try {
-            val page = api.tree(id, folder, requestCursor)
-            entries = mergePage(entries, page.entries, requestCursor == null)
-            nextCursor = page.nextCursor
-            cursor = requestCursor
-            loadedRefresh = refresh
-            error = null
-        } catch (e: CancellationException) { throw e }
-        catch (e: HttpException) {
-            if (e.code() == 410 && requestCursor != null) {
-                cursor = null
-                pageRequestId++
-            } else {
-                error = "파일 목록을 불러올 수 없습니다."
-            }
-        } catch (_: Exception) {
-            error = "파일 목록을 불러올 수 없습니다."
-        } finally {
-            loading = false
-        }
-    }
-    BackHandler(enabled = folder.isNotBlank()) {
-        onFolder(folder.substringBeforeLast("/", ""))
-    }
-    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        Text("파일  / " + folder, style = MaterialTheme.typography.titleMedium)
-        ErrorText(error)
-        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if (error != null && !loading) {
-            OutlinedButton(onClick = { reload++ }) { Text("다시 불러오기") }
-        }
-        LazyColumn {
-            if (folder.isNotBlank()) item {
-                Text("‹  상위 폴더", modifier = Modifier.fillMaxWidth().clickable {
-                    onFolder(folder.substringBeforeLast("/", ""))
-                }.padding(12.dp))
-            }
-            items(entries, key = { it.path }) { entry ->
-                HorizontalDivider()
-                Row(
-                    Modifier.fillMaxWidth().clickable {
-                        if (entry.directory) onFolder(entry.path) else open(entry.path)
-                    }.padding(vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(if (entry.directory) "▸" else "·", modifier = Modifier.width(28.dp))
-                    Text(entry.name, fontSize = 13.sp, maxLines = 2,
-                        overflow = TextOverflow.Ellipsis)
-                }
-            }
-            if (nextCursor != null) item {
-                OutlinedButton(onClick = {
-                    cursor = nextCursor
-                    pageRequestId++
-                }, enabled = !loading && error == null,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                    Text("더 보기")
-                }
-            }
+        val current = status
+        if (current == null && error == null) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (current != null) {
+            GitChangesTree(current, scroll, collapsed, onToggle, open)
         }
     }
 }
@@ -628,6 +586,9 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         return
     }
     var font by remember(prefs.fontSize) { mutableFloatStateOf(prefs.fontSize.toFloat()) }
+    var markdownFont by remember(prefs.markdownFontSize) {
+        mutableFloatStateOf(prefs.markdownFontSize.toFloat())
+    }
     var height by remember(prefs.lineHeight) { mutableFloatStateOf(prefs.lineHeight) }
     var padding by remember(prefs.padding) { mutableFloatStateOf(prefs.padding.toFloat()) }
     Column(
@@ -637,7 +598,7 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         Text("코드 표시", style = MaterialTheme.typography.titleLarge)
         Text("글자 크기  " + font.roundToInt() + " px")
         Slider(value = font, onValueChange = { font = it },
-            valueRange = 10f..20f, steps = 9,
+            valueRange = 4f..20f, steps = 15,
             onValueChangeFinished = { onPrefs { it.copy(fontSize = font.roundToInt()) } })
         Text("줄 높이  " + String.format("%.1f", height))
         Slider(value = height, onValueChange = { height = it },
@@ -650,7 +611,18 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         SettingSwitch("긴 코드 줄바꿈", prefs.wrap) { enabled -> onPrefs { it.copy(wrap = enabled) } }
         SettingSwitch("줄 번호 표시", prefs.numbers) { enabled -> onPrefs { it.copy(numbers = enabled) } }
         SettingSwitch("좌우 비교 Diff", prefs.split) { enabled -> onPrefs { it.copy(split = enabled) } }
+        SettingSwitch("전체 파일 문맥 보기", prefs.fullDiff) {
+            enabled -> onPrefs { it.copy(fullDiff = enabled) }
+        }
         SettingSwitch("다크 테마", prefs.dark) { enabled -> onPrefs { it.copy(dark = enabled) } }
+        HorizontalDivider()
+        Text("MD 미리보기", style = MaterialTheme.typography.titleLarge)
+        Text("글자 크기  " + markdownFont.roundToInt() + " px")
+        Slider(value = markdownFont, onValueChange = { markdownFont = it },
+            valueRange = 12f..32f, steps = 19,
+            onValueChangeFinished = {
+                onPrefs { it.copy(markdownFontSize = markdownFont.roundToInt()) }
+            })
         HorizontalDivider()
         Text("앱 업데이트", style = MaterialTheme.typography.titleMedium)
         Text(updateStatus, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -685,7 +657,10 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         }
         HorizontalDivider()
         Text("연결된 PC", style = MaterialTheme.typography.titleMedium)
-        Text(prefs.pcURL, fontSize = 12.sp)
+        Text(Uri.parse(prefs.pcURL).host.orEmpty().substringBefore(".").ifBlank { "PC" },
+            fontWeight = FontWeight.SemiBold)
+        Text(prefs.pcURL, fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
         HorizontalDivider()
         Text("오픈소스 라이선스", style = MaterialTheme.typography.titleMedium)
         OutlinedButton(onClick = { noticePath = "android-library-notices.txt" }) {
@@ -713,49 +688,139 @@ private fun ReaderPage(
     prefs: ViewerPreferences, onBack: () -> Unit
 ) {
     val hasDiff = target.scope != null || target.commit != null
-    var mode by remember(target) { mutableStateOf(if (hasDiff) "diff" else "file") }
+    val fileName = target.path.substringAfterLast("/")
+    val imageFile = fileName.substringAfterLast(".", "").lowercase() in
+        setOf("png", "jpg", "jpeg", "gif", "webp")
+    val markdownFile = fileName.substringAfterLast(".", "").lowercase() in
+        setOf("md", "markdown")
+    val suffix = fileName.substringAfterLast(".", "")
+        .takeIf { it.isNotBlank() && fileName.substringBeforeLast(".").isNotEmpty() }
+    val stem = if (suffix != null) fileName.dropLast(suffix.length + 1) else fileName
+    val displayStem = if (stem.length > 24) stem.take(11) + "…" + stem.takeLast(10) else stem
+    val folders = target.path.substringBeforeLast("/", "").split("/").filter { it.isNotEmpty() }
+    val parentLabel = when {
+        folders.isEmpty() -> "저장소 루트"
+        folders.size > 3 -> "…  ›  " + folders.takeLast(3).joinToString("  ›  ")
+        else -> folders.joinToString("  ›  ")
+    }
+    var showFullPath by rememberSaveable(target.path) { mutableStateOf(false) }
+    var mode by rememberSaveable(target) {
+        mutableStateOf(when {
+            imageFile -> "image"
+            markdownFile -> "markdown"
+            hasDiff -> "diff"
+            else -> "file"
+        })
+    }
     var result by remember(target, mode) { mutableStateOf<ReaderResult>(ReaderResult.Loading) }
     var retry by remember(target, mode) { mutableIntStateOf(0) }
-    LaunchedEffect(api, id, target, mode, retry) {
+    LaunchedEffect(api, id, target, mode, retry, prefs.fullDiff) {
         result = ReaderResult.Loading
         try {
-            val content = when {
-                target.commit != null && mode == "diff" ->
-                    api.commitDiff(id, target.commit, target.path).diff
-                target.commit != null ->
-                    api.commitFile(id, target.commit, target.path).content
-                target.scope != null && mode == "diff" ->
-                    api.diff(id, target.scope, target.path).diff
-                else -> api.file(id, target.path,
-                    if (target.scope == "staged") "index" else null).content
+            if (mode == "image") {
+                result = withContext(Dispatchers.IO) {
+                    val response = api.image(id, target.path,
+                        if (target.scope == "staged") "index" else null, target.commit)
+                    val bytes = response.use { it.bytes() }
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    require(bounds.outWidth > 0 && bounds.outHeight > 0) {
+                        "Invalid image"
+                    }
+                    var sample = 1
+                    while (bounds.outWidth.toLong() * bounds.outHeight /
+                        (sample.toLong() * sample) > 8_000_000
+                        || bounds.outWidth / sample > 4096 || bounds.outHeight / sample > 4096) {
+                        sample *= 2
+                    }
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size,
+                        BitmapFactory.Options().apply { inSampleSize = sample })
+                        ?: throw IllegalArgumentException("Invalid image")
+                    ReaderResult.Picture(bitmap)
+                }
+            } else {
+                val content = when {
+                    target.commit != null && mode == "diff" ->
+                        api.commitDiff(id, target.commit, target.path, prefs.fullDiff).diff
+                    target.commit != null ->
+                        api.commitFile(id, target.commit, target.path).content
+                    target.scope != null && mode == "diff" ->
+                        api.diff(id, target.scope, target.path, prefs.fullDiff).diff
+                    else -> api.file(id, target.path,
+                        if (target.scope == "staged") "index" else null).content
+                }
+                result = if (content == null) ReaderResult.Missing else ReaderResult.Content(content)
             }
-            result = if (content == null) ReaderResult.Missing else ReaderResult.Content(content)
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) { result = ReaderResult.Failed }
     }
-    Scaffold(topBar = {
-        TopAppBar(
-            title = { Text(target.path.substringAfterLast("/"),
-                style = MaterialTheme.typography.titleMedium) },
-            navigationIcon = { TextButton(onClick = onBack) { Text("‹") } }
+    if (showFullPath) {
+        AlertDialog(
+            onDismissRequest = { showFullPath = false },
+            title = { Text("파일 경로") },
+            text = { Text(target.path) },
+            confirmButton = {
+                TextButton(onClick = { showFullPath = false }) { Text("닫기") }
+            }
         )
-    }) { pad ->
-        Column(Modifier.fillMaxSize().padding(pad)) {
-            Text(target.path, modifier = Modifier.padding(horizontal = 12.dp),
-                fontSize = 11.sp, maxLines = 2,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+    Scaffold(topBar = {
+        Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
+            TopAppBar(
+                title = {
+                    Row(Modifier.fillMaxWidth().clickable { showFullPath = true },
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Icon(gitFileIcon(fileName), contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp))
+                        Text(displayStem, modifier = Modifier.weight(1f, fill = false),
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (suffix != null) Text("." + suffix,
+                            style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                    }
+                },
+                navigationIcon = { TextButton(onClick = onBack) { Text("‹") } }
+            )
+            Row(Modifier.fillMaxWidth().clickable { showFullPath = true }
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Outlined.Folder, contentDescription = null,
+                    modifier = Modifier.size(15.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(6.dp))
+                Text(parentLabel, modifier = Modifier.weight(1f),
+                    fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Icon(Icons.Outlined.Info, contentDescription = "전체 경로 보기",
+                    modifier = Modifier.size(15.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier.padding(horizontal = 8.dp)) {
-                if (hasDiff) TextButton(onClick = { mode = "diff" }) {
-                    Text(if (mode == "diff") "● 변경" else "변경", fontSize = 12.sp)
-                }
-                TextButton(onClick = { mode = "file" }) {
-                    Text(if (mode == "file") "● 파일" else "파일", fontSize = 12.sp)
-                }
-                TextButton(onClick = { mode = "raw" }) {
-                    Text(if (mode == "raw") "● 원문" else "원문", fontSize = 12.sp)
+                if (imageFile) {
+                    TextButton(onClick = { mode = "image" }) {
+                        Text(if (mode == "image") "● 이미지" else "이미지", fontSize = 12.sp)
+                    }
+                } else {
+                    if (markdownFile) TextButton(onClick = { mode = "markdown" }) {
+                        Text(if (mode == "markdown") "● 미리보기" else "미리보기", fontSize = 12.sp)
+                    }
+                    if (hasDiff) TextButton(onClick = { mode = "diff" }) {
+                        Text(if (mode == "diff") "● 변경" else "변경", fontSize = 12.sp)
+                    }
+                    TextButton(onClick = { mode = "file" }) {
+                        Text(if (mode == "file") "● 코드" else "코드", fontSize = 12.sp)
+                    }
+                    TextButton(onClick = { mode = "raw" }) {
+                        Text(if (mode == "raw") "● 원문" else "원문", fontSize = 12.sp)
+                    }
                 }
             }
+        }
+    }) { pad ->
+        Box(Modifier.fillMaxSize().padding(pad)) {
             when (val current = result) {
                 ReaderResult.Loading -> LinearProgressIndicator(Modifier.fillMaxWidth())
                 ReaderResult.Missing -> Text(
@@ -764,13 +829,20 @@ private fun ReaderPage(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 ReaderResult.Failed -> Column {
-                    ErrorText("파일을 읽을 수 없습니다.")
+                    ErrorText(if (imageFile) "이미지를 표시할 수 없습니다."
+                        else "파일을 읽을 수 없습니다.")
                     OutlinedButton(onClick = { retry++ }) { Text("다시 시도") }
                 }
+                is ReaderResult.Picture -> Image(
+                    bitmap = current.bitmap.asImageBitmap(),
+                    contentDescription = fileName,
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
+                    contentScale = ContentScale.Fit
+                )
                 is ReaderResult.Content -> CodeViewer(
                     path = target.path, mode = mode,
                     source = current.text, preferences = prefs,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.fillMaxSize()
                 )
             }
         }

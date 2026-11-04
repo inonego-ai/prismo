@@ -14,15 +14,22 @@
       <img class="mark" src="./mark.svg" alt="" width="29" height="29"/>
       <span>Prismo</span>
     </div>
-    <div class="server-status" role="status">
-      <span class="status-dot" id="server-dot"></span>
-      <span id="server-label">확인 중</span>
-      <button id="pc-update-button" class="icon-button" type="button" aria-label="PC 업데이트 확인" title="PC 업데이트 확인">
-        <img src="./icons/refresh-cw.svg" alt=""/>
-      </button>
-      <button id="power-button" class="icon-button" type="button" aria-label="서버 시작 또는 중지" title="서버 시작 또는 중지">
-        <img src="./icons/power.svg" alt=""/>
-      </button>
+    <div class="topbar-controls">
+      <div class="server-status" role="status">
+        <span class="status-dot" id="server-dot"></span>
+        <span id="server-label">확인 중</span>
+        <button id="power-button" class="icon-button" type="button" aria-label="서버 시작 또는 중지" title="서버 시작 또는 중지">
+          <img src="./icons/power.svg" alt=""/>
+        </button>
+      </div>
+      <div class="topbar-utilities">
+        <button id="pc-update-button" class="icon-button" type="button" aria-label="PC 업데이트 확인" title="PC 업데이트 확인">
+          <img src="./icons/refresh-cw.svg" alt=""/>
+        </button>
+        <button id="settings-button" class="settings-button" type="button" title="설정">
+          <img src="./icons/settings.svg" alt=""/> 설정
+        </button>
+      </div>
     </div>
   </header>
   <main class="workspace">
@@ -80,6 +87,19 @@
         <button type="button" class="subtle" id="cancel-pair-button">취소</button>
       </span>
     </div>
+  </dialog>
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-heading">
+    <div class="settings-header">
+      <h2 id="settings-heading">설정</h2>
+      <button id="close-settings-button" class="subtle" type="button">닫기</button>
+    </div>
+    <label class="settings-option" for="login-startup-toggle">
+      <span>
+        <strong>Windows 로그인 시 자동 실행</strong>
+        <small id="login-startup-hint">로그인하면 Prismo를 트레이에서 시작합니다.</small>
+      </span>
+      <input id="login-startup-toggle" type="checkbox" role="switch" disabled/>
+    </label>
   </dialog>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </body>

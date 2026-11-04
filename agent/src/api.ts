@@ -2,14 +2,16 @@ import Fastify from "fastify";
 import { requireRepository, listRepositories } from "./config.js";
 import { PairingStore } from "./pairing.js";
 import { UpdateStore } from "./updates.js";
-import { AccessError, getCommits, getCommitDiff, getCommitFile, getCommitFiles, getDiff, getStatus, getRepositorySummaries, readFileSnapshot, TreeStore } from "./git.js";
+import { AccessError, getCommits, getCommitDiff, getCommitFile, getCommitFiles, getDiff, getStatus, readFileSnapshot, readImagePreview, TreeStore } from "./git.js";
 
 type Params = { id: string };
 type PathQuery = { path?: string };
 type FileQuery = PathQuery & { revision?: "worktree" | "index" };
 type TreeQuery = PathQuery & { cursor?: string };
 type CommitQuery = { cursor?: string };
-type DiffQuery = PathQuery & { scope?: "staged" | "unstaged" | "untracked" };
+type DiffQuery = PathQuery & {
+  scope?: "staged" | "unstaged" | "untracked"; full?: string;
+};
 export function createApp(pairing: PairingStore, updates: UpdateStore,
                           privateConnectionAvailable: () => Promise<boolean>) {
   const app = Fastify({ logger: false, bodyLimit: 1024, forceCloseConnections: true });
@@ -117,13 +119,9 @@ export function createApp(pairing: PairingStore, updates: UpdateStore,
       throw error;
     }
   });
-  app.get("/api/v1/repositories", async () => {
-    const summaries = await getRepositorySummaries(await listRepositories());
-    return { repositories: summaries.map(({ repo, status, issue }) => ({
-      id: repo.id, name: repo.name, available: status !== null, issue,
-      branch: status?.branch ?? null, changeCount: status?.changes.length ?? 0
-    })) };
-  });
+  app.get("/api/v1/repositories", async () => ({
+    repositories: (await listRepositories()).map(repo => ({ id: repo.id, name: repo.name }))
+  }));
   app.get<{ Params: Params }>("/api/v1/repositories/:id/status", async request => {
     return getStatus(await repoOr404(request.params.id));
   });
@@ -140,12 +138,31 @@ export function createApp(pairing: PairingStore, updates: UpdateStore,
     const content = await readFileSnapshot(repo, request.query.path, revision);
     return { path: request.query.path, content };
   });
+  app.get<{ Params: Params; Querystring: FileQuery & { commit?: string } }>(
+    "/api/v1/repositories/:id/image", async (request, reply) => {
+      const { path, revision, commit } = request.query;
+      if (!path || revision && !["worktree", "index"].includes(revision)
+        || commit && revision === "index") {
+        throw new AccessError("Invalid image request");
+      }
+      const preview = await readImagePreview(await repoOr404(request.params.id), path,
+        revision ?? "worktree", commit);
+      if (!preview) throw new AccessError("Image not found", 404);
+      reply.header("Cache-Control", "private, no-store");
+      reply.header("X-Content-Type-Options", "nosniff");
+      return reply.type(preview.contentType).send(preview.bytes);
+    }
+  );
   app.get<{ Params: Params; Querystring: DiffQuery }>("/api/v1/repositories/:id/diff", async request => {
     const { path, scope } = request.query;
     if (!path || !scope || !["staged", "unstaged", "untracked"].includes(scope)) {
       throw new AccessError("Valid path and scope are required");
     }
-    const diff = await getDiff(await repoOr404(request.params.id), path, scope);
+    if (request.query.full !== undefined && !["true", "false"].includes(request.query.full)) {
+      throw new AccessError("Invalid diff context");
+    }
+    const diff = await getDiff(await repoOr404(request.params.id), path, scope,
+      request.query.full === "true");
     return { path, scope, diff };
   });
   app.get<{ Params: Params; Querystring: CommitQuery }>(
@@ -166,13 +183,16 @@ export function createApp(pairing: PairingStore, updates: UpdateStore,
       return { path: request.query.path, content };
     }
   );
-  app.get<{ Params: Params & { hash: string }; Querystring: PathQuery }>(
+  app.get<{ Params: Params & { hash: string }; Querystring: PathQuery & { full?: string } }>(
     "/api/v1/repositories/:id/commits/:hash/diff", async request => {
       if (!request.query.path) throw new AccessError("Path is required");
+      if (request.query.full !== undefined && !["true", "false"].includes(request.query.full)) {
+        throw new AccessError("Invalid diff context");
+      }
       return {
         path: request.query.path,
         diff: await getCommitDiff(await repoOr404(request.params.id),
-          request.params.hash, request.query.path)
+          request.params.hash, request.query.path, request.query.full === "true")
       };
     }
   );

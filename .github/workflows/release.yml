@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            agent/package-lock.json
+            desktop/package-lock.json
+            renderer/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - name: Install dependencies
+        run: |
+          npm ci --prefix agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --prefix desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --prefix renderer
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify version
+        run: |
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
+          $agentVersion = (Get-Content agent/package.json -Raw | ConvertFrom-Json).version
+          $rendererVersion = (Get-Content renderer/package.json -Raw | ConvertFrom-Json).version
+          $android = Get-Content android/app/build.gradle.kts -Raw
+          if ($android -notmatch 'versionName\s*=\s*"([^"]+)"') { throw 'Android version not found' }
+          if ($env:GITHUB_REF_NAME -ne "v$version" -or $agentVersion -ne $version -or
+              $rendererVersion -ne $version -or $Matches[1] -ne $version) {
+            throw 'Release tag and component versions do not match'
+          }
+      - name: Test Agent
+        working-directory: agent
+        run: npm test
+      - name: Test Windows app
+        working-directory: desktop
+        run: npm test
+      - name: Test renderer
+        working-directory: renderer
+        run: npm test
+      - name: Test and build Android debug app
+        working-directory: android
+        run: .\gradlew.bat :app:testDebugUnitTest :app:assembleDebug --console=plain
+      - name: Build Windows portable app
+        working-directory: desktop
+        run: npm run portable
+      - name: Build Windows NSIS installer
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run installer
+      - name: Build signed Android release
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.PRISMO_ANDROID_KEYSTORE_BASE64 }}
+          PRISMO_ANDROID_STORE_PASSWORD: ${{ secrets.PRISMO_ANDROID_STORE_PASSWORD }}
+          PRISMO_ANDROID_KEY_ALIAS: ${{ secrets.PRISMO_ANDROID_KEY_ALIAS }}
+        run: |
+          if (-not $env:KEYSTORE_BASE64 -or -not $env:PRISMO_ANDROID_STORE_PASSWORD -or
+              -not $env:PRISMO_ANDROID_KEY_ALIAS) { throw 'Android release signing secrets are missing' }
+          $env:PRISMO_ANDROID_KEYSTORE = Join-Path $env:RUNNER_TEMP 'prismo-release.p12'
+          $env:PRISMO_ANDROID_KEY_PASSWORD = $env:PRISMO_ANDROID_STORE_PASSWORD
+          [IO.File]::WriteAllBytes($env:PRISMO_ANDROID_KEYSTORE, [Convert]::FromBase64String($env:KEYSTORE_BASE64))
+          try {
+            .\gradlew.bat :app:assembleRelease --console=plain
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & "$env:ANDROID_HOME\build-tools\35.0.0\apksigner.bat" verify --verbose app/build/outputs/apk/release/app-release.apk
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item -LiteralPath $env:PRISMO_ANDROID_KEYSTORE -Force -ErrorAction SilentlyContinue
+          }
+      - name: Prepare release assets
+        run: |
+          New-Item -ItemType Directory -Path release-assets | Out-Null
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
+          Copy-Item -LiteralPath "desktop/release/Prismo $version.exe" -Destination 'release-assets/Prismo-Windows-Portable.exe'
+          $installer = "Prismo-Setup-$version.exe"
+          $blockmap = "$installer.blockmap"
+          Copy-Item -LiteralPath "desktop/release-installer/$installer" -Destination "release-assets/$installer"
+          Copy-Item -LiteralPath "desktop/release-installer/$blockmap" -Destination "release-assets/$blockmap"
+          Copy-Item -LiteralPath 'desktop/release-installer/latest.yml' -Destination 'release-assets/latest.yml'
+          Copy-Item -LiteralPath 'android/app/build/outputs/apk/release/app-release.apk' -Destination 'release-assets/app-release.apk'
+          Copy-Item -LiteralPath 'android/app/build/outputs/apk/release/prismo-update.json' -Destination 'release-assets/prismo-update.json'
+          $files = @('Prismo-Windows-Portable.exe', $installer, $blockmap, 'latest.yml', 'app-release.apk', 'prismo-update.json')
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath "release-assets/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $file"
+          }
+          [IO.File]::WriteAllLines((Join-Path $PWD 'release-assets/SHA256SUMS.txt'), $lines, [Text.Encoding]::ASCII)
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: prismo-release-assets
+          path: release-assets/
+          if-no-files-found: error
+      - name: Stop Gradle before saving caches
+        if: always()
+        working-directory: android
+        run: .\gradlew.bat --stop
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: prismo-release-assets
+          path: release-assets
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          notes="Windows NSIS installer and portable EXE (both unsigned) plus signed Android APK. Windows SmartScreen may warn. Automatic Windows installation and updates require a trusted code-signing certificate; until then, use manual installation. Existing Android debug installations cannot be updated in place with the release APK. Real-device operation remains to be verified."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "Prismo $GITHUB_REF_NAME" --notes "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "Prismo $GITHUB_REF_NAME" --notes "$notes" release-assets/*
+          fi

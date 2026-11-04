@@ -37,6 +37,7 @@
       "style.css",
       "renderer.mjs",
       "connection.mjs",
+      "login-startup.mjs",
       "update-check.mjs",
       "mark.svg",
       "mark.png",

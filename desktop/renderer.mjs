@@ -2,6 +2,9 @@ const element = id => document.getElementById(id);
 const ui = {
   serverDot: element("server-dot"), serverLabel: element("server-label"),
   power: element("power-button"), pcUpdate: element("pc-update-button"),
+  settingsButton: element("settings-button"), settingsDialog: element("settings-dialog"),
+  closeSettings: element("close-settings-button"),
+  loginStartup: element("login-startup-toggle"), loginStartupHint: element("login-startup-hint"),
   status: element("connection-status"),
   empty: element("pair-placeholder"), message: element("pair-message"),
   active: element("pair-active"), qr: element("qr-image"), countdown: element("countdown"),
@@ -162,6 +165,32 @@ async function refreshState() {
     lastFullSync = Date.now();
   }
 }
+ui.settingsButton.addEventListener("click", async () => {
+  ui.settingsButton.disabled = true;
+  try {
+    const current = await window.prismo.getLoginStartup();
+    ui.loginStartup.checked = current.enabled;
+    ui.loginStartup.disabled = !current.supported;
+    ui.loginStartupHint.textContent = current.supported
+      ? "로그인하면 Prismo를 트레이에서 시작합니다."
+      : "Windows 배포판에서 사용할 수 있습니다.";
+    ui.settingsDialog.showModal();
+  } catch { notify("설정을 불러올 수 없습니다."); }
+  finally { ui.settingsButton.disabled = false; }
+});
+ui.closeSettings.addEventListener("click", () => ui.settingsDialog.close());
+ui.loginStartup.addEventListener("change", async () => {
+  const requested = ui.loginStartup.checked;
+  ui.loginStartup.disabled = true;
+  try {
+    const result = await window.prismo.setLoginStartup(requested);
+    ui.loginStartup.checked = result.enabled;
+    if (result.enabled !== requested) notify("Windows 시작 설정이 적용되지 않았습니다.");
+  } catch {
+    ui.loginStartup.checked = !requested;
+    notify("Windows 시작 설정을 변경할 수 없습니다.");
+  } finally { ui.loginStartup.disabled = false; }
+});
 ui.pcUpdate.addEventListener("click", async () => {
   ui.pcUpdate.disabled = true;
   try {

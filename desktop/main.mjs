@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import QRCode from "qrcode";
 import electronUpdater from "electron-updater";
 import { findPairAddress } from "./connection.mjs";
-import { createUpdateCheckGate } from "./update-check.mjs";
+import { checkLatestGitHubRelease, createUpdateCheckGate } from "./update-check.mjs";
+import { createLoginStartup } from "./login-startup.mjs";
 
 const execute = promisify(execFile);
 const { autoUpdater } = electronUpdater;
@@ -28,6 +29,8 @@ const updates = new UpdateStore();
 let releaseSource = null;
 let pcUpdateState = { kind: "idle", message: "" };
 const updateCheck = createUpdateCheckGate();
+const loginStartup = createLoginStartup(app);
+const startedAtLogin = loginStartup.isStartupLaunch(process.argv);
 const PORT = 3000;
 const WINDOW_PAGE = pathToFileURL(join(here, "index.html")).href;
 const HEALTH_URL = "http://127.0.0.1:" + PORT + "/health";
@@ -45,8 +48,8 @@ let privateConnectionCheckedAt = 0;
 let privateConnectionReady = false;
 const primary = app.requestSingleInstanceLock();
 if (!primary) app.quit();
-else app.on("second-instance", () => {
-  showWindow();
+else app.on("second-instance", (_event, commandLine) => {
+  if (!loginStartup.isStartupLaunch(commandLine)) showWindow();
 });
 
 async function health() {
@@ -238,11 +241,24 @@ function configurePCUpdates() {
 async function checkPCUpdate(automatic = false) {
   if (!releaseSource) return sendUpdateStatus("unconfigured", "릴리스 저장소 미설정");
   if (!updateManifestAvailable() || !(await executableSigned())) {
-    if (!automatic) {
-      const url = releasePage();
-      if (url) await shell.openExternal(url);
-    }
-    return sendUpdateStatus("manual", "GitHub 릴리스 열기");
+    return updateCheck.run(async () => {
+      sendUpdateStatus("checking", "업데이트 확인 중");
+      try {
+        const result = await checkLatestGitHubRelease(releaseSource, app.getVersion());
+        if (result.kind === "available" && !automatic && window && !window.isDestroyed()) {
+          const choice = await dialog.showMessageBox(window, {
+            title: "Prismo 업데이트", type: "info",
+            message: result.message,
+            detail: "자동 다운로드·설치는 코드 서명된 NSIS 설치형에서 지원합니다.",
+            buttons: ["닫기", "다운로드 페이지 열기"], defaultId: 0, cancelId: 0
+          });
+          if (choice.response === 1) await shell.openExternal(releasePage());
+        }
+        return sendUpdateStatus(result.kind, result.message);
+      } catch {
+        return sendUpdateStatus("error", "업데이트 정보를 확인하지 못했습니다.");
+      }
+    });
   }
   return updateCheck.run(async () => {
     sendUpdateStatus("checking", "업데이트 확인 중");
@@ -298,6 +314,8 @@ function registerHandlers() {
   handle("prismo:state", () => snapshot());
   handle("prismo:pairing-state", () => pairingState());
   handle("prismo:check-pc-update", () => checkPCUpdate());
+  handle("prismo:get-login-startup", () => loginStartup.get());
+  handle("prismo:set-login-startup", (_event, enabled) => loginStartup.set(enabled));
   handle("prismo:start-server", async () => {
     await startAgent();
     return snapshot();
@@ -410,7 +428,9 @@ function openWindow() {
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, reply) => {
     reply(false);
   });
-  window.once("ready-to-show", () => window?.show());
+  window.once("ready-to-show", () => {
+    if (!startedAtLogin) window?.show();
+  });
   window.loadFile(join(here, "index.html"));
 }
 if (primary) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,16 +9,17 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { addRepository, listRepositories, removeRepository, repositoryRoot } from "../config.js";
 import { createApp } from "../api.js";
-import { getCommitDiff, getCommitFile, getCommitFiles, getCommits, getDiff, getRepositorySummaries, getStatus, parseStatus, readFileSnapshot, readRepoFile, TreeStore } from "../git.js";
+import { getCommitDiff, getCommitFile, getCommitFiles, getCommits, getDiff, getRepositorySummaries, getStatus, parseStatus, readFileSnapshot, readImagePreview, readRepoFile, TreeStore } from "../git.js";
 import { PairingStore } from "../pairing.js";
 import { UpdateStore } from "../updates.js";
 
 const exec = promisify(execFile);
+const tempRoot = await realpath(tmpdir());
 async function git(cwd: string, args: string[]) {
   await exec("git", args, { cwd, timeout: 10000 });
 }
 test("read-only repository registration and API behavior", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-test-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-test-"));
   const repoPath = join(base, "repo");
   process.env.PRISMO_CONFIG_DIR = join(base, "settings");
   const pairing = new PairingStore();
@@ -42,8 +43,12 @@ test("read-only repository registration and API behavior", async () => {
     assert.equal((await listRepositories()).length, 1);
     const status = await getStatus(registered);
     assert.equal(status.branch, "main");
-    assert.equal(status.changes.some(item => item.path === "hello.ts" && item.unstaged), true);
-    assert.equal(status.changes.some(item => item.path === "new.ts" && item.untracked), true);
+    assert.equal(status.changes.some(item => item.path === "hello.ts"
+      && item.workingKind === "modified"), true);
+    const untracked = status.changes.find(item => item.path === "new.ts");
+    assert.equal(untracked?.stagedKind, null);
+    assert.equal(untracked?.workingKind, "untracked");
+    assert.deepEqual(Object.keys(untracked ?? {}).sort(), ["path", "stagedKind", "workingKind"]);
     assert.equal(status.changes.some(item => item.path === ".env"), false);
     const unauthorized = await inject({ method: "GET", url: "/api/v1/repositories" });
     assert.equal(unauthorized.statusCode, 401);
@@ -60,7 +65,7 @@ test("read-only repository registration and API behavior", async () => {
     privateConnection = true;
     assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair", payload: { code } })).statusCode, 401);
     const listing = await inject({ method: "GET", url: "/api/v1/repositories" });
-    assert.equal(listing.json().repositories[0].id, registered.id);
+    assert.deepEqual(listing.json().repositories, [{ id: registered.id, name: registered.name }]);
     const tree = await inject({ method: "GET", url: "/api/v1/repositories/" + registered.id + "/tree" });
     assert.equal(tree.json().entries.some((item: { path: string }) => item.path === ".env"), false);
     const invalidCursor = await inject({ method: "GET", url: "/api/v1/repositories/" + registered.id + "/tree?cursor=invalid" });
@@ -130,6 +135,8 @@ test("read-only repository registration and API behavior", async () => {
     const deletedDiff = await inject({ method: "GET", url: prefix +
       "/commits/" + deletedHash.trim() + "/diff?path=hello.ts" });
     assert.match(deletedDiff.json().diff, /deleted file mode/);
+    assert.equal(await removeRepository(repoPath), false);
+    assert.equal((await listRepositories()).length, 1);
     assert.equal(await removeRepository(registered.id), true);
     assert.equal(await removeRepository(registered.id), false);
     assert.equal((await listRepositories()).length, 0);
@@ -154,7 +161,7 @@ test("read-only repository registration and API behavior", async () => {
 });
 
 test("subfolder registration discovers the real root despite local worktree redirection", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-subfolder-register-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-subfolder-register-"));
   const path = join(base, "repo");
   const subfolder = join(path, "nested", "folder");
   const outside = join(base, "outside");
@@ -186,7 +193,7 @@ test("subfolder registration discovers the real root despite local worktree redi
 });
 
 test("repository root replacement cannot redirect root listings or file reads", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-root-link-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-root-link-"));
   const root = join(base, "repo");
   const moved = join(base, "original");
   const outside = join(base, "outside");
@@ -209,7 +216,7 @@ test("repository root replacement cannot redirect root listings or file reads", 
 });
 
 test("Git path arguments are literal and cannot expose protected files", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-literal-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-literal-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -238,7 +245,7 @@ test("Git path arguments are literal and cannot expose protected files", async (
 });
 
 test("renamed files keep both paths in working and historical diffs", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-rename-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-rename-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -252,7 +259,7 @@ test("renamed files keep both paths in working and historical diffs", async () =
     await git(path, ["add", "after.ts"]);
     const repo = { id: "rename", name: "repo", path };
     const status = await getStatus(repo);
-    assert.equal(status.changes[0]?.kind, "renamed");
+    assert.equal(status.changes[0]?.stagedKind, "renamed");
     assert.equal(status.changes[0]?.previousPath, "before.ts");
     const staged = await getDiff(repo, "after.ts", "staged");
     assert.match(staged, /rename from before\.ts/);
@@ -270,7 +277,7 @@ test("renamed files keep both paths in working and historical diffs", async () =
 });
 
 test("staged rename remains a rename after its working file is deleted", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-rename-rd-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-rename-rd-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -283,10 +290,9 @@ test("staged rename remains a rename after its working file is deleted", async (
     await unlink(join(path, "after.ts"));
     const repo = { id: "rd", name: "repo", path };
     const entry = (await getStatus(repo)).changes.find(item => item.path === "after.ts");
-    assert.equal(entry?.kind, "renamed");
+    assert.equal(entry?.stagedKind, "renamed");
     assert.equal(entry?.previousPath, "before.ts");
-    assert.equal(entry?.staged, true);
-    assert.equal(entry?.unstaged, true);
+    assert.equal(entry?.workingKind, "deleted");
     assert.match(await getDiff(repo, "after.ts", "staged"), /rename from before\.ts/);
     assert.match(await getDiff(repo, "after.ts", "unstaged"), /deleted file mode/);
   } finally {
@@ -295,7 +301,7 @@ test("staged rename remains a rename after its working file is deleted", async (
 });
 
 test("unstaged rename status retains both paths and serves its diff", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-unstaged-rename-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-unstaged-rename-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -309,10 +315,9 @@ test("unstaged rename status retains both paths and serves its diff", async () =
     const repo = { id: "unstaged-rename", name: "repo", path };
     const status = await getStatus(repo);
     const change = status.changes.find(item => item.path === "after.ts");
-    assert.equal(change?.kind, "renamed");
+    assert.equal(change?.workingKind, "renamed");
     assert.equal(change?.previousPath, "before.ts");
-    assert.equal(change?.staged, false);
-    assert.equal(change?.unstaged, true);
+    assert.equal(change?.stagedKind, null);
     const diff = await getDiff(repo, "after.ts", "unstaged");
     assert.match(diff, /rename from before\.ts/);
     assert.match(diff, /rename to after\.ts/);
@@ -322,7 +327,7 @@ test("unstaged rename status retains both paths and serves its diff", async () =
 });
 
 test("Git execution ignores inherited repository and config selectors", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-git-env-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-git-env-"));
   const selected = join(base, "selected");
   const alternate = join(base, "alternate");
   const envNames = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
@@ -374,7 +379,7 @@ test("Git execution ignores inherited repository and config selectors", async ()
 });
 
 test("repository-local worktree settings cannot redirect Git outside the registered root", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-worktree-config-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-worktree-config-"));
   const path = join(base, "repo");
   const outside = join(base, "outside");
   try {
@@ -399,7 +404,7 @@ test("repository-local worktree settings cannot redirect Git outside the registe
 });
 
 test("untracked diffs quote unusual paths and mark missing final newlines", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-untracked-diff-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-untracked-diff-"));
   const path = join(base, "repo");
   const fileName = "café.ts";
   try {
@@ -409,6 +414,23 @@ test("untracked diffs quote unusual paths and mark missing final newlines", asyn
     assert.match(diff, /diff --git "a\/caf\\303\\251\.ts" "b\/caf\\303\\251\.ts"/);
     assert.match(diff, /\+\+\+ "b\/caf\\303\\251\.ts"/);
     assert.match(diff, /\\ No newline at end of file/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("staged and working change kinds remain distinct for one file", async () => {
+  const base = await mkdtemp(join(tempRoot, "prismo-mixed-status-"));
+  const path = join(base, "repo");
+  try {
+    await git(base, ["init", "-b", "main", path]);
+    await writeFile(join(path, "example.ts"), "staged\\n");
+    await git(path, ["add", "example.ts"]);
+    await writeFile(join(path, "example.ts"), "working\\n");
+    const status = await getStatus({ id: "mixed-status", name: "repo", path });
+    const change = status.changes.find(item => item.path === "example.ts");
+    assert.equal(change?.stagedKind, "added");
+    assert.equal(change?.workingKind, "modified");
   } finally {
     await rm(base, { recursive: true, force: true });
   }
@@ -424,7 +446,7 @@ test("NUL porcelain parsing preserves newlines and header-like text in filenames
 });
 
 test("missing worktree files return null but a missing repository stays an error", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-file-missing-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-file-missing-"));
   const path = join(base, "repo");
   const moved = join(base, "repo-moved");
   try {
@@ -441,7 +463,7 @@ test("missing worktree files return null but a missing repository stays an error
 });
 
 test("Git infrastructure errors retain their cause and do not mark valid repositories missing", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-git-errors-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-git-errors-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -472,7 +494,7 @@ test("Git infrastructure errors retain their cause and do not mark valid reposit
 });
 
 test("Git executable failures return server errors rather than missing commits", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-git-api-error-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-git-api-error-"));
   const path = join(base, "repo");
   const oldConfig = process.env.PRISMO_CONFIG_DIR;
   const oldPath = process.env.PATH;
@@ -512,7 +534,7 @@ test("Git executable failures return server errors rather than missing commits",
 });
 
 test("commit endpoints reject hashes outside current HEAD history", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-reachable-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-reachable-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -542,7 +564,7 @@ test("commit endpoints reject hashes outside current HEAD history", async () => 
 });
 
 test("Git patches reject protected descendants during directory-to-file replacement", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-diff-privacy-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-diff-privacy-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -568,7 +590,7 @@ test("Git patches reject protected descendants during directory-to-file replacem
 });
 
 test("pairing requests are bounded before private connection inspection", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-pair-limit-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-pair-limit-"));
   let checks = 0;
   const app = createApp(new PairingStore(join(base, "paired.json")),
     new UpdateStore(), async () => { checks++; return true; });
@@ -589,7 +611,7 @@ test("pairing requests are bounded before private connection inspection", async 
 });
 
 test("merge conflicts remain visible without exposing protected paths", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-conflict-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-conflict-"));
   const path = join(base, "repo");
   const file = "source with space.ts";
   const save = async (value: string) => {
@@ -606,13 +628,13 @@ test("merge conflicts remain visible without exposing protected paths", async ()
     await save("feature");
     await git(path, ["checkout", "main"]);
     await save("main");
-    await assert.rejects(git(path, ["merge", "feature"]));
+    await assert.rejects(git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "merge", "feature"]));
     const repo = { id: "conflict", name: "repo", path };
     const status = await getStatus(repo);
     const conflict = status.changes.find(change => change.path === file);
-    assert.equal(conflict?.kind, "conflicted");
-    assert.equal(conflict?.staged, false);
-    assert.equal(conflict?.unstaged, false);
+    assert.equal(conflict?.workingKind, "conflicted");
+    assert.equal(conflict?.stagedKind, null);
     assert.equal(status.changes.some(change => change.path === ".env"), false);
     assert.match(await readRepoFile(repo, file), /<<<<<<< HEAD/);
     await assert.rejects(getDiff(repo, file, "unstaged"), { statusCode: 404 });
@@ -621,14 +643,138 @@ test("merge conflicts remain visible without exposing protected paths", async ()
   }
 });
 
+test("image API requires pairing and streams image bytes without text conversion", async () => {
+  const base = await mkdtemp(join(tempRoot, "prismo-image-api-"));
+  const path = join(base, "repo");
+  const original = process.env.PRISMO_CONFIG_DIR;
+  process.env.PRISMO_CONFIG_DIR = join(base, "settings");
+  const pairing = new PairingStore();
+  const app = createApp(pairing, new UpdateStore(), async () => true);
+  try {
+    await git(base, ["init", "-b", "main", path]);
+    const image = Buffer.from("89504e470d0a1a0a0000000d494844520000000100000001", "hex");
+    await writeFile(join(path, "sample.png"), image);
+    const repo = await addRepository(path);
+    await app.ready();
+    const url = "/api/v1/repositories/" + repo.id + "/image?path=sample.png";
+    assert.equal((await app.inject({ method: "GET", url })).statusCode, 401);
+    const code = pairing.issue().secret;
+    const response = await app.inject({
+      method: "POST", url: "/api/v1/pair", payload: { code }
+    });
+    assert.equal(response.statusCode, 200);
+    const token = response.json().token as string;
+    const preview = await app.inject({
+      method: "GET", url, headers: { authorization: "Bearer " + token }
+    });
+    assert.equal(preview.statusCode, 200);
+    assert.match(String(preview.headers["content-type"]), /image\/png/);
+    assert.deepEqual(preview.rawPayload, image);
+  } finally {
+    await app.close();
+    if (original === undefined) delete process.env.PRISMO_CONFIG_DIR;
+    else process.env.PRISMO_CONFIG_DIR = original;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("image previews preserve binary bytes across worktree, index and commits", async () => {
+  const base = await mkdtemp(join(tempRoot, "prismo-image-"));
+  const path = join(base, "repo");
+  try {
+    await git(base, ["init", "-b", "main", path]);
+    const image = Buffer.from("89504e470d0a1a0a0000000d494844520000000100000001", "hex");
+    await writeFile(join(path, "sample.png"), image);
+    const repo = { id: "image", name: "repo", path };
+    const working = await readImagePreview(repo, "sample.png");
+    assert.equal(working?.contentType, "image/png");
+    assert.deepEqual(working?.bytes, image);
+    await git(path, ["add", "sample.png"]);
+    assert.deepEqual((await readImagePreview(repo, "sample.png", "index"))?.bytes, image);
+    await git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "commit", "-m", "Add image"]);
+    const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: path });
+    assert.deepEqual((await readImagePreview(repo, "sample.png", "worktree", stdout.trim()))?.bytes,
+      image);
+    await writeFile(join(path, "sample.png"), "not an image");
+    await assert.rejects(readImagePreview(repo, "sample.png"), { statusCode: 415 });
+    await assert.rejects(readImagePreview(repo, ".env"), { statusCode: 403 });
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("isolated Git respects host autocrlf when showing unchanged diff context", async () => {
+  const base = await mkdtemp(join(tempRoot, "prismo-eol-"));
+  const path = join(base, "repo");
+  const home = join(base, "home");
+  try {
+    await mkdir(home);
+    await writeFile(join(home, ".gitconfig"), "[core]\n\tautocrlf = true\n");
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
+    delete env.GIT_CONFIG_GLOBAL;
+    delete env.GIT_CONFIG_NOSYSTEM;
+    const gitHost = (args: string[]) => exec("git", ["-C", path, ...args],
+      { env, timeout: 10000 });
+    await exec("git", ["init", "-b", "main", path], { cwd: base, env });
+    const original = Array.from({ length: 24 }, (_, index) => "unchanged-" + index);
+    await writeFile(join(path, "example.cs"), original.join("\n") + "\n");
+    await gitHost(["add", "example.cs"]);
+    await gitHost(["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "commit", "-m", "Initial"]);
+    const edited = original.slice();
+    edited[17] = "updated";
+    await writeFile(join(path, "example.cs"), edited.join("\r\n") + "\r\n");
+    const moduleURL = new URL("../git.js", import.meta.url).href;
+    const code = "import { getDiff } from " + JSON.stringify(moduleURL) + "; "
+      + "const repo = { id: 'eol', name: 'repo', path: process.argv[1] }; "
+      + "const diff = await getDiff(repo, 'example.cs', 'unstaged', true); "
+      + "const lines = diff.slice(diff.indexOf('@@')).split('\\n'); "
+      + "const added = lines.filter(line => line.startsWith('+')).length; "
+      + "const deleted = lines.filter(line => line.startsWith('-')).length; "
+      + "const context = lines.filter(line => line.startsWith(' ')).length; "
+      + "if (added !== 1 || deleted !== 1 || context !== 23) "
+      + "throw Error(JSON.stringify({ added, deleted, context }));";
+    await exec(process.execPath, ["--input-type=module", "--eval", code, path],
+      { env, timeout: 15000 });
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("full diff context includes unchanged lines for files and commits", async () => {
+  const base = await mkdtemp(join(tempRoot, "prismo-full-diff-"));
+  const path = join(base, "repo");
+  try {
+    await git(base, ["init", "-b", "main", path]);
+    const initial = Array.from({ length: 20 }, (_, index) => "unchanged-" + (index + 1));
+    await writeFile(join(path, "example.cs"), initial.join("\n") + "\n");
+    await git(path, ["add", "example.cs"]);
+    await git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "commit", "-m", "First"]);
+    const changed = initial.slice();
+    changed[15] = "updated";
+    await writeFile(join(path, "example.cs"), changed.join("\n") + "\n");
+    const repo = { id: "full", name: "repo", path };
+    assert.doesNotMatch(await getDiff(repo, "example.cs", "unstaged"), /unchanged-1\n/);
+    assert.match(await getDiff(repo, "example.cs", "unstaged", true), /unchanged-1\n/);
+    await git(path, ["add", "example.cs"]);
+    await git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "commit", "-m", "Second"]);
+    const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: path });
+    assert.doesNotMatch(await getCommitDiff(repo, stdout.trim(), "example.cs"), /unchanged-1\n/);
+    assert.match(await getCommitDiff(repo, stdout.trim(), "example.cs", true), /unchanged-1\n/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test("concurrent processes preserve every repository registration", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-config-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-config-"));
   const settings = join(base, "settings");
   const original = process.env.PRISMO_CONFIG_DIR;
   try {
     await mkdir(join(settings, "Prismo"), { recursive: true });
-    const oldLock = join(settings, "Prismo", "repositories.json.lock");
-    await writeFile(oldLock, "Legacy file lock");
     const locations = Array.from({ length: 4 }, (_, i) => join(base, "repo-" + i));
     await Promise.all(locations.map(location => git(base, ["init", "-b", "main", location])));
     const moduleURL = new URL("../config.js", import.meta.url).href;
@@ -641,7 +787,6 @@ test("concurrent processes preserve every repository registration", async () => 
     const found = await listRepositories();
     assert.equal(found.length, locations.length);
     assert.equal(new Set(found.map(item => item.path)).size, locations.length);
-    assert.equal(await readFile(oldLock, "utf8"), "Legacy file lock");
   } finally {
     if (original === undefined) delete process.env.PRISMO_CONFIG_DIR;
     else process.env.PRISMO_CONFIG_DIR = original;
@@ -650,7 +795,7 @@ test("concurrent processes preserve every repository registration", async () => 
 });
 
 test("merge commit changes are compared against the first parent", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-history-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-history-"));
   const path = join(base, "repo");
   const commit = async (filename: string) => {
     await writeFile(join(path, filename), filename + "\n");
@@ -677,7 +822,7 @@ test("merge commit changes are compared against the first parent", async () => {
 });
 
 test("commit history preserves separator characters in user-controlled metadata", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-commit-meta-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-commit-meta-"));
   const path = join(base, "repo");
   try {
     await git(base, ["init", "-b", "main", path]);
@@ -696,7 +841,7 @@ test("commit history preserves separator characters in user-controlled metadata"
 });
 
 test("CLI status verifies Prismo health identity rather than HTTP 200 alone", async () => {
-  const base = await mkdtemp(join(tmpdir(), "prismo-cli-health-"));
+  const base = await mkdtemp(join(tempRoot, "prismo-cli-health-"));
   let service = "Other";
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
@@ -726,7 +871,7 @@ test("CLI status verifies Prismo health identity rather than HTTP 200 alone", as
 });
 
 test("commit history pages remain stable when new commits arrive", async () => {
-  const root = await mkdtemp(join(tmpdir(), "prismo-commits-"));
+  const root = await mkdtemp(join(tempRoot, "prismo-commits-"));
   const path = join(root, "repo");
   try {
     await git(root, ["init", "-b", "main", path]);

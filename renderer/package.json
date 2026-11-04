@@ -5,13 +5,15 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "test:layout": "node scripts/run-layout-probe.cjs",
     "prebuild": "node -e \"require('node:fs').mkdirSync('build', { recursive: true })\"",
     "build": "esbuild src/renderer.ts --bundle --minify --format=iife --target=es2020 --outfile=../android/app/src/main/assets/renderer.js --metafile=./build/renderer-meta.json && node scripts/generate-notices.mjs"
   },
   "dependencies": {
     "diff2html": "^3.4.53",
     "dompurify": "^3.4.17",
-    "highlight.js": "^11.11.1"
+    "highlight.js": "^11.11.1",
+    "marked": "15.0.12"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"

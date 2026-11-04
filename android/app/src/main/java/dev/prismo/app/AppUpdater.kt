@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.CoroutineStart
@@ -22,14 +21,11 @@ object AppUpdater {
     private const val APK_MIME = "application/vnd.android.package-archive"
 
     @Suppress("DEPRECATION")
-    fun installedVersionCode(context: Context): Long {
-        val info = context.packageManager.getPackageInfo(context.packageName, 0)
-        return if (Build.VERSION.SDK_INT >= 28) info.longVersionCode
-        else info.versionCode.toLong()
-    }
+    fun installedVersionCode(context: Context): Long =
+        context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
 
     fun canInstall(context: Context): Boolean =
-        Build.VERSION.SDK_INT < 26 || context.packageManager.canRequestPackageInstalls()
+        context.packageManager.canRequestPackageInstalls()
 
     fun requestInstallPermission(context: Context) {
         val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
@@ -39,26 +35,20 @@ object AppUpdater {
 
     @Suppress("DEPRECATION")
     private fun verifyPackage(context: Context, archive: File, info: AppUpdate) {
-        val flags = if (Build.VERSION.SDK_INT >= 28)
-            PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        val flags = PackageManager.GET_SIGNING_CERTIFICATES
         val candidate = requireNotNull(context.packageManager.getPackageArchiveInfo(archive.path, flags)) {
             "APK를 열 수 없습니다."
         }
         require(candidate.packageName == context.packageName &&
             candidate.packageName == info.packageName) { "앱이 일치하지 않습니다." }
-        val code = if (Build.VERSION.SDK_INT >= 28) candidate.longVersionCode
-            else candidate.versionCode.toLong()
+        val code = candidate.longVersionCode
         require(code == info.versionCode && code > installedVersionCode(context)) {
             "새로운 버전이 아닙니다."
         }
 
         val installed = context.packageManager.getPackageInfo(context.packageName, flags)
-        val currentSignatures: Array<android.content.pm.Signature> = if (Build.VERSION.SDK_INT >= 28)
-            requireNotNull(installed.signingInfo).apkContentsSigners
-        else requireNotNull(installed.signatures)
-        val candidateSignatures: Array<android.content.pm.Signature> = if (Build.VERSION.SDK_INT >= 28)
-            requireNotNull(candidate.signingInfo).apkContentsSigners
-        else requireNotNull(candidate.signatures)
+        val currentSignatures = requireNotNull(installed.signingInfo).apkContentsSigners
+        val candidateSignatures = requireNotNull(candidate.signingInfo).apkContentsSigners
         require(currentSignatures.isNotEmpty() &&
             currentSignatures.size == candidateSignatures.size &&
             currentSignatures.all { current ->

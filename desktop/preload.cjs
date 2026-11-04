@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld("prismo", Object.freeze({
   state: () => ipcRenderer.invoke("prismo:state"),
   pairingState: () => ipcRenderer.invoke("prismo:pairing-state"),
   checkPCUpdate: () => ipcRenderer.invoke("prismo:check-pc-update"),
+  getLoginStartup: () => ipcRenderer.invoke("prismo:get-login-startup"),
+  setLoginStartup: enabled => ipcRenderer.invoke("prismo:set-login-startup", enabled),
   onPCUpdate: callback => {
     const listener = (_event, info) => callback(info);
     ipcRenderer.on("prismo:pc-update", listener);

@@ -107,17 +107,11 @@ export async function addRepository(location: string): Promise<Repository> {
     return repo;
   });
 }
-export async function removeRepository(locationOrID: string): Promise<boolean> {
+export async function removeRepository(id: string): Promise<boolean> {
   return withConfigLock(async () => {
     const repositories = await listRepositories();
-    let found = repositories.find(repo => repo.id === locationOrID);
-    if (!found && /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(locationOrID)) return false;
-    if (!found) {
-      const root = await repositoryRoot(locationOrID);
-      found = repositories.find(repo => normalized(repo.path) === normalized(root));
-    }
-    if (!found) return false;
-    await saveRepositories(repositories.filter(repo => repo.id !== found.id));
+    if (!repositories.some(repo => repo.id === id)) return false;
+    await saveRepositories(repositories.filter(repo => repo.id !== id));
     return true;
   });
 }

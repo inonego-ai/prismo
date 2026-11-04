@@ -9,6 +9,7 @@ import type { Repository } from "./config.js";
 const exec = promisify(execFile);
 const MAX_GIT = 2 * 1024 * 1024;
 const MAX_FILE = 512 * 1024;
+const MAX_IMAGE = 16 * 1024 * 1024;
 const MAX_ACTIVE_GIT = 4;
 const MAX_PENDING_GIT = 32;
 let activeGit = 0;
@@ -78,8 +79,68 @@ export async function safePath(root: string, requested = ""): Promise<string> {
   if (isProtectedPath(actualRelative)) throw new AccessError("Path is not accessible", 403);
   return actual;
 }
-export async function execGit(cwd: string, args: string[], workTreeRoot?: string): Promise<string> {
-  const result = await withGitSlot(async () => {
+function gitEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME",
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"]) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return { ...env, GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+    GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat", GIT_EXTERNAL_DIFF: "",
+    GIT_LITERAL_PATHSPECS: "1", GIT_TERMINAL_PROMPT: "0" };
+}
+
+// Git normally applies the user's text conversion settings before comparing files.
+// The restricted Git environment below intentionally ignores untrusted global/system
+// configuration. Read only the two safe EOL keys from the effective host settings,
+// then reapply those exact values without re-enabling hooks, filters or Git includes.
+const textOptionCache = new Map<string, { until: number; options: Promise<string[]> }>();
+async function gitTextOptions(root: string): Promise<string[]> {
+  const cached = textOptionCache.get(root);
+  if (cached && cached.until > Date.now()) return cached.options;
+  const options = (async () => {
+    const env = gitEnvironment();
+    delete env.GIT_CONFIG_NOSYSTEM;
+    delete env.GIT_CONFIG_GLOBAL;
+    let output: string;
+    try {
+      const result = await exec("git", ["config", "--get-regexp",
+        "^core\\.(autocrlf|eol)$"], {
+        cwd: root, encoding: "utf8", timeout: 5000, maxBuffer: 4096,
+        windowsHide: true, env
+      });
+      output = result.stdout;
+    } catch (error) {
+      if ((error as { code?: number }).code === 1) return [];
+      throw error;
+    }
+    const values = new Map<string, string>();
+    for (const line of output.split(/\r?\n/)) {
+      const separator = line.indexOf(" ");
+      if (separator === -1) continue;
+      const key = line.slice(0, separator).toLowerCase();
+      const raw = line.slice(separator + 1).trim().toLowerCase();
+      if (key === "core.autocrlf") {
+        const value = ["true", "yes", "on"].includes(raw) ? "true"
+          : ["false", "no", "off"].includes(raw) ? "false" : raw;
+        if (["true", "false", "input"].includes(value)) values.set(key, value);
+      } else if (key === "core.eol" && ["lf", "crlf", "native"].includes(raw)) {
+        values.set(key, raw);
+      }
+    }
+    return [...values].flatMap(([key, value]) => ["-c", key + "=" + value]);
+  })();
+  if (textOptionCache.size >= 64) textOptionCache.delete(textOptionCache.keys().next().value!);
+  textOptionCache.set(root, { until: Date.now() + 30_000, options });
+  try { return await options; }
+  catch (error) { textOptionCache.delete(root); throw error; }
+}
+async function runGit(
+  cwd: string, args: string[], workTreeRoot?: string, binary = false
+): Promise<string | Buffer> {
+  return withGitSlot(async () => {
     const root = await safePath(cwd);
     let workTree: string | undefined;
     if (workTreeRoot !== undefined) {
@@ -97,33 +158,41 @@ export async function execGit(cwd: string, args: string[], workTreeRoot?: string
         throw new AccessError("Invalid Git metadata", 403);
       }
     }
-    const env: NodeJS.ProcessEnv = {};
-    for (const name of ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "HOME",
-      "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"]) {
-      const value = process.env[name];
-      if (value !== undefined) env[name] = value;
-    }
-    return exec("git", [
+    const textOptions = await gitTextOptions(root);
+    const result = await exec("git", [
+      ...textOptions,
       ...(workTree ? ["-c", "core.bare=false", "--work-tree=" + workTree] : []),
       "-c", "core.pager=cat", "-c", "diff.external=", "-c", "core.fsmonitor=false",
       "--no-pager", ...args
     ], {
-      cwd: root, encoding: "utf8", timeout: 5000, maxBuffer: MAX_GIT, windowsHide: true,
-      env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
-        GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat", GIT_EXTERNAL_DIFF: "",
-        GIT_LITERAL_PATHSPECS: "1", GIT_TERMINAL_PROMPT: "0" }
+      cwd: root, encoding: binary ? "buffer" : "utf8", timeout: 5000,
+      maxBuffer: binary ? MAX_IMAGE + 65536 : MAX_GIT, windowsHide: true,
+      env: gitEnvironment()
     });
+    return result.stdout;
   });
-  return result.stdout;
+}
+export async function execGit(cwd: string, args: string[], workTreeRoot?: string): Promise<string> {
+  return await runGit(cwd, args, workTreeRoot) as string;
 }
 function execRepoGit(repo: Repository, args: string[]): Promise<string> {
   return execGit(repo.path, args, repo.path);
 }
+function execRepoGitBytes(repo: Repository, args: string[]): Promise<Buffer> {
+  return runGit(repo.path, args, repo.path, true) as Promise<Buffer>;
+}
 export interface Change {
-  path: string; previousPath?: string; staged: boolean; unstaged: boolean;
-  untracked: boolean; kind: string;
+  path: string; previousPath?: string;
+  stagedKind: string | null; workingKind: string | null;
 }
 export interface RepoStatus { branch: string; head: string | null; changes: Change[] }
+function statusKind(state: string): string {
+  if (state === "R") return "renamed";
+  if (state === "C") return "copied";
+  if (state === "D") return "deleted";
+  if (state === "A") return "added";
+  return "modified";
+}
 export function parseStatus(output: string): RepoStatus {
   let branch = "(unknown)"; let head: string | null = null;
   const changes: Change[] = [];
@@ -139,15 +208,15 @@ export function parseStatus(output: string): RepoStatus {
     }
     if (record.startsWith("? ")) {
       const path = record.slice(2);
-      if (!isProtectedPath(path)) changes.push({ path, staged: false, unstaged: false, untracked: true, kind: "added" });
+      if (!isProtectedPath(path)) changes.push({
+        path, stagedKind: null, workingKind: "untracked"
+      });
       continue;
     }
     if (record.startsWith("u ")) {
       const path = record.split(" ").slice(10).join(" ");
       if (path && !isProtectedPath(path)) {
-        changes.push({
-          path, staged: false, unstaged: false, untracked: false, kind: "conflicted"
-        });
+        changes.push({ path, stagedKind: null, workingKind: "conflicted" });
       }
       continue;
     }
@@ -159,18 +228,19 @@ export function parseStatus(output: string): RepoStatus {
     let previousPath: string | undefined;
     if (marker === "2") previousPath = records[++i];
     if (!path || isProtectedPath(path) || (previousPath && isProtectedPath(previousPath))) continue;
-    const flag = xy.replaceAll(".", "");
-    const kind = marker === "2" && (xy[0] === "R" || xy[1] === "R") ? "renamed"
-      : flag.includes("D") ? "deleted" : flag.includes("A") ? "added" : "modified";
     changes.push({
       path, ...(previousPath ? { previousPath } : {}),
-      staged: xy[0] !== ".", unstaged: xy[1] !== ".", untracked: false, kind
+      stagedKind: xy[0] !== "." ? statusKind(xy[0]!) : null,
+      workingKind: xy[1] !== "." ? statusKind(xy[1]!) : null
     });
   }
   return { branch, head, changes };
 }
-export async function getStatus(repo: Repository): Promise<RepoStatus> {
-  return parseStatus(await execRepoGit(repo, ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]));
+export async function getStatus(repo: Repository, includeUntracked = true): Promise<RepoStatus> {
+  return parseStatus(await execRepoGit(repo, [
+    "status", "--porcelain=v2", "-z", "--branch",
+    includeUntracked ? "--untracked-files=all" : "--untracked-files=no"
+  ]));
 }
 type RepoIssue = "unavailable" | "temporary";
 export async function getRepositorySummaries(repositories: Repository[]) {
@@ -198,7 +268,7 @@ export async function getRepositorySummaries(repositories: Repository[]) {
   }
   return summaries;
 }
-export async function readRepoFile(repo: Repository, path: string): Promise<string> {
+async function readRepoBytes(repo: Repository, path: string, limit: number): Promise<Buffer> {
   const full = await safePath(repo.path, path);
   const expected = await lstat(full);
   if (!expected.isFile()) throw new AccessError("Not a regular file", 400);
@@ -212,21 +282,24 @@ export async function readRepoFile(repo: Repository, path: string): Promise<stri
       || await realpath(full) !== full) {
       throw new AccessError("File changed while opening", 403);
     }
-    if (opened.size > MAX_FILE) throw new AccessError("File too large", 413);
-    const buffer = Buffer.allocUnsafe(MAX_FILE + 1);
+    if (opened.size > limit) throw new AccessError("File too large", 413);
+    const buffer = Buffer.allocUnsafe(Math.min(opened.size + 1, limit + 1));
     let length = 0;
     while (length < buffer.length) {
       const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
       if (bytesRead === 0) break;
       length += bytesRead;
     }
-    if (length > MAX_FILE) throw new AccessError("File too large", 413);
-    const bytes = buffer.subarray(0, length);
-    if (bytes.includes(0)) throw new AccessError("Binary file cannot be rendered", 415);
-    return bytes.toString("utf8");
+    if (length > limit) throw new AccessError("File too large", 413);
+    return buffer.subarray(0, length);
   } finally {
     await handle.close();
   }
+}
+export async function readRepoFile(repo: Repository, path: string): Promise<string> {
+  const bytes = await readRepoBytes(repo, path, MAX_FILE);
+  if (bytes.includes(0)) throw new AccessError("Binary file cannot be rendered", 415);
+  return bytes.toString("utf8");
 }
 type TreeEntry = { name: string; path: string; directory: boolean };
 type TreeSnapshot = { repoID: string; path: string; expiresAt: number; entries: TreeEntry[] };
@@ -318,11 +391,14 @@ function quoteDiffPath(path: string): string {
     : byte === 0x0d ? "\\r" : byte < 0x20 || byte >= 0x7f
       ? "\\" + byte.toString(8).padStart(3, "0") : String.fromCharCode(byte)).join("") + '"';
 }
-export async function getDiff(repo: Repository, path: string, scope: "staged" | "unstaged" | "untracked") {
+export async function getDiff(
+  repo: Repository, path: string, scope: "staged" | "unstaged" | "untracked",
+  full = false
+) {
   validatePath(path);
   if (scope === "untracked") {
     const status = await getStatus(repo);
-    if (!status.changes.some(c => c.path === path && c.untracked)) throw new AccessError("Not an untracked file", 404);
+    if (!status.changes.some(c => c.path === path && c.workingKind === "untracked")) throw new AccessError("Not an untracked file", 404);
     const content = await readRepoFile(repo, path);
     const lines = content.length ? content.split("\n") : [];
     const hasFinalNewline = content.endsWith("\n");
@@ -334,13 +410,15 @@ export async function getDiff(repo: Repository, path: string, scope: "staged" | 
     return "diff --git " + quoteDiffPath("a/" + path) + " " + newPath
       + "\nnew file mode 100644\n--- /dev/null\n+++ " + newPath + "\n" + hunk;
   }
-  const status = await getStatus(repo);
+  const status = await getStatus(repo, false);
   const change = status.changes.find(item => item.path === path
-    && (scope === "staged" ? item.staged : item.unstaged));
+    && (scope === "staged" ? item.stagedKind !== null
+      : item.workingKind !== null && item.workingKind !== "conflicted"));
   if (!change) throw new AccessError("No accessible changes for that path and scope", 404);
   const previousPath = change.previousPath ? validatePath(change.previousPath) : null;
   const output = await execRepoGit(repo, ["diff", "--no-ext-diff", "--no-textconv",
-    previousPath ? "--find-renames" : "--no-renames", "--raw", "-z", "--patch", "--unified=3",
+    previousPath ? "--find-renames" : "--no-renames", "--raw", "-z", "--patch",
+    full ? "--unified=999999" : "--unified=3",
     ...(scope === "staged" ? ["--cached"] : []), "--",
     ...(previousPath ? [previousPath] : []), path]);
   return verifiedDiff(output, previousPath ? [previousPath, path] : [path]);
@@ -350,7 +428,7 @@ export async function getCommits(repo: Repository, cursor?: string) {
   let anchor: string;
   let offset = 0;
   if (cursor === undefined) {
-    const { head } = await getStatus(repo);
+    const { head } = await getStatus(repo, false);
     if (!head) return { commits: [], nextCursor: null };
     anchor = head;
   } else {
@@ -429,31 +507,38 @@ async function commitChanges(repo: Repository, hash: string, parents: string[]):
   }
   return changes;
 }
-export async function getCommitDiff(repo: Repository, hash: string, path: string) {
+export async function getCommitDiff(repo: Repository, hash: string, path: string, full = false) {
   validatePath(path);
   const parents = await commitParents(repo, hash);
   const change = (await commitChanges(repo, hash, parents)).find(item => item.path === path);
   if (!change) return "";
   const options = ["--no-ext-diff", "--no-textconv",
     change.previousPath ? "--find-renames" : "--no-renames",
-    "--raw", "-z", "--patch", "--unified=3"];
+    "--raw", "-z", "--patch", full ? "--unified=999999" : "--unified=3"];
   const paths = change.previousPath ? [validatePath(change.previousPath), path] : [path];
   const output = parents[0]
     ? await execRepoGit(repo, ["diff", ...options, parents[0], hash, "--", ...paths])
     : await execRepoGit(repo, ["show", "--format=", ...options, hash, "--", ...paths]);
   return verifiedDiff(output, paths);
 }
-async function readGitBlob(repo: Repository, objectID: string): Promise<string> {
+async function readGitBlobBytes(
+  repo: Repository, objectID: string, limit: number
+): Promise<Buffer> {
   if (!/^[0-9a-f]{40,64}$/i.test(objectID)) throw new AccessError("Invalid Git object");
   const size = Number((await execRepoGit(repo, ["cat-file", "-s", objectID])).trim());
-  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE) {
+  if (!Number.isSafeInteger(size) || size < 0 || size > limit) {
     throw new AccessError("File too large", 413);
   }
-  const content = await execRepoGit(repo, ["cat-file", "blob", objectID]);
-  if (content.includes("\0")) throw new AccessError("Binary file cannot be rendered", 415);
-  return content;
+  const bytes = await execRepoGitBytes(repo, ["cat-file", "blob", objectID]);
+  if (bytes.length !== size) throw new AccessError("Git object size mismatch", 500);
+  return bytes;
 }
-export async function readIndexFile(repo: Repository, path: string): Promise<string | null> {
+async function readGitBlob(repo: Repository, objectID: string): Promise<string> {
+  const bytes = await readGitBlobBytes(repo, objectID, MAX_FILE);
+  if (bytes.includes(0)) throw new AccessError("Binary file cannot be rendered", 415);
+  return bytes.toString("utf8");
+}
+async function indexBlobID(repo: Repository, path: string): Promise<string | null> {
   validatePath(path);
   const output = await execRepoGit(repo, ["ls-files", "--stage", "-z", "--", path]);
   const entry = output.split("\0").find(Boolean);
@@ -462,7 +547,11 @@ export async function readIndexFile(repo: Repository, path: string): Promise<str
   if (!match || match[3] !== path || !["100644", "100755"].includes(match[1] ?? "")) {
     throw new AccessError("Not a regular indexed file", 403);
   }
-  return readGitBlob(repo, match[2]!);
+  return match[2]!;
+}
+export async function readIndexFile(repo: Repository, path: string): Promise<string | null> {
+  const objectID = await indexBlobID(repo, path);
+  return objectID ? readGitBlob(repo, objectID) : null;
 }
 export async function readFileSnapshot(
   repo: Repository, path: string, revision: "worktree" | "index"
@@ -480,7 +569,7 @@ export async function readFileSnapshot(
     throw error;
   }
 }
-export async function getCommitFile(repo: Repository, hash: string, path: string): Promise<string | null> {
+async function commitBlobID(repo: Repository, hash: string, path: string): Promise<string | null> {
   await requireReachableCommit(repo, hash);
   validatePath(path);
   const tree = await execRepoGit(repo, ["ls-tree", "-z", "-l", hash, "--", path]);
@@ -490,7 +579,54 @@ export async function getCommitFile(repo: Repository, hash: string, path: string
   if (!match || match[4] !== path || !["100644", "100755"].includes(match[1] ?? "")) {
     throw new AccessError("Not a regular file in commit", 403);
   }
-  return readGitBlob(repo, match[2]!);
+  return match[2]!;
+}
+export async function getCommitFile(repo: Repository, hash: string, path: string): Promise<string | null> {
+  const objectID = await commitBlobID(repo, hash, path);
+  return objectID ? readGitBlob(repo, objectID) : null;
+}
+const IMAGE_TYPES: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp"
+};
+function imageContentType(path: string, bytes: Buffer): string {
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  const type = IMAGE_TYPES[extension];
+  if (!type) throw new AccessError("Image preview is not supported for this format", 415);
+  const valid = type === "image/png"
+    ? bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))
+    : type === "image/jpeg"
+      ? bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+      : type === "image/gif"
+        ? ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"))
+        : bytes.subarray(0, 4).toString("ascii") === "RIFF"
+          && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+  if (!valid) throw new AccessError("Invalid image format", 415);
+  return type;
+}
+export async function readImagePreview(
+  repo: Repository, path: string, revision: "worktree" | "index" = "worktree",
+  commit?: string
+): Promise<{ bytes: Buffer; contentType: string } | null> {
+  validatePath(path);
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  if (!IMAGE_TYPES[extension]) {
+    throw new AccessError("Image preview is not supported for this format", 415);
+  }
+  let bytes: Buffer;
+  if (commit !== undefined || revision === "index") {
+    const objectID = commit !== undefined
+      ? await commitBlobID(repo, commit, path) : await indexBlobID(repo, path);
+    if (!objectID) return null;
+    bytes = await readGitBlobBytes(repo, objectID, MAX_IMAGE);
+  } else {
+    try { bytes = await readRepoBytes(repo, path, MAX_IMAGE); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+  return { bytes, contentType: imageContentType(path, bytes) };
 }
 export async function getCommitFiles(repo: Repository, hash: string): Promise<string[]> {
   const parents = await commitParents(repo, hash);

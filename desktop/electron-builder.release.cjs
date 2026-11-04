@@ -13,16 +13,22 @@ if (!github || !valid(github.owner) || !valid(github.repo)) {
 const hasSigning = Boolean(
   process.env.CSC_LINK || process.env.WIN_CSC_LINK || process.env.CSC_NAME
 );
-const publisherName = process.env.PRISMO_WINDOWS_PUBLISHER;
-if (!hasSigning || !publisherName || !publisherName.trim()) {
-  throw Error("A Windows signing certificate and matching publisher name are required.");
+const publisherName = process.env.PRISMO_WINDOWS_PUBLISHER?.trim();
+if (hasSigning && !publisherName) {
+  throw Error("PRISMO_WINDOWS_PUBLISHER is required when signing a Windows installer.");
 }
 
 module.exports = {
   ...base,
+  forceCodeSigning: hasSigning,
   directories: { ...base.directories, output: "release-installer" },
-  win: { ...base.win, target: ["nsis"], publisherName: [publisherName] },
+  win: {
+    ...base.win,
+    target: ["nsis"],
+    ...(hasSigning ? { publisherName: [publisherName] } : {})
+  },
   nsis: {
+    artifactName: "Prismo-Setup-${version}.${ext}",
     oneClick: false,
     perMachine: false,
     allowToChangeInstallationDirectory: true
