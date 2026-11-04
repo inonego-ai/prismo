@@ -1,0 +1,81 @@
+{
+  "name": "prismo",
+  "productName": "Prismo",
+  "version": "0.1.0",
+  "description": "Prismo for Windows",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "prepack": "node scripts/stage-agent.mjs",
+    "preportable": "node scripts/stage-agent.mjs",
+    "preinstaller": "node scripts/stage-agent.mjs",
+    "pack": "electron-builder --win --dir",
+    "portable": "electron-builder --win portable --publish never",
+    "installer": "electron-builder --win nsis --config electron-builder.release.cjs --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "electron": "42.11.16",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "dev.prismo.desktop",
+    "productName": "Prismo",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.mjs",
+      "preload.cjs",
+      "index.html",
+      "style.css",
+      "renderer.mjs",
+      "connection.mjs",
+      "update-check.mjs",
+      "mark.svg",
+      "mark.png",
+      "mark.ico",
+      "THIRD_PARTY_NOTICES.txt",
+      "icons/*.svg",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../agent/dist",
+        "to": "agent/dist",
+        "filter": [
+          "api.js",
+          "config.js",
+          "git.js",
+          "pairing.js",
+          "releaseConfig.js",
+          "updates.js"
+        ]
+      },
+      {
+        "from": ".runtime/agent/node_modules",
+        "to": "agent/node_modules"
+      },
+      {
+        "from": "../agent/package.json",
+        "to": "agent/package.json"
+      },
+      {
+        "from": "../release-config.json",
+        "to": "release-config.json"
+      }
+    ],
+    "win": {
+      "icon": "mark.ico",
+      "target": [
+        "portable"
+      ]
+    }
+  }
+}
