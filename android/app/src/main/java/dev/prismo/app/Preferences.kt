@@ -14,7 +14,7 @@ import kotlinx.coroutines.flow.map
 val Context.prismoStore by preferencesDataStore(name = "prismo")
 
 private object Keys {
-    val url = stringPreferencesKey("pc_url")
+    val pcID = stringPreferencesKey("pc_id")
     val deviceToken = stringPreferencesKey("device_token")
     val font = intPreferencesKey("font_size")
     val markdownFont = intPreferencesKey("markdown_font_size")
@@ -28,7 +28,7 @@ private object Keys {
 }
 
 data class ViewerPreferences(
-    val pcURL: String = "",
+    val pcID: String = "",
     val deviceToken: String = "",
     val fontSize: Int = 12,
     val markdownFontSize: Int = 18,
@@ -42,8 +42,8 @@ data class ViewerPreferences(
 )
 
 private fun readPreferences(values: Preferences) = ViewerPreferences(
-    pcURL = values[Keys.url] ?: "",
-    deviceToken = values[Keys.deviceToken] ?: "",
+    pcID = values[Keys.pcID] ?: "",
+    deviceToken = IrohIdentity.revealToken(values[Keys.deviceToken] ?: ""),
     fontSize = values[Keys.font] ?: 12,
     markdownFontSize = values[Keys.markdownFont] ?: 18,
     lineHeight = values[Keys.height] ?: 1.3f,
@@ -61,8 +61,8 @@ val Context.viewerPreferences get() = prismoStore.data.map(::readPreferences)
 suspend fun Context.updateViewerPreferences(change: (ViewerPreferences) -> ViewerPreferences) {
     prismoStore.edit { values: MutablePreferences ->
         val updated = change(readPreferences(values))
-        values[Keys.url] = updated.pcURL
-        values[Keys.deviceToken] = updated.deviceToken
+        values[Keys.pcID] = updated.pcID
+        values[Keys.deviceToken] = IrohIdentity.protectToken(updated.deviceToken)
         values[Keys.font] = updated.fontSize
         values[Keys.markdownFont] = updated.markdownFontSize
         values[Keys.height] = updated.lineHeight

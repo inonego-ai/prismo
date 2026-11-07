@@ -83,7 +83,7 @@ private fun ChangeTreeRow(
     section: String,
     collapsed: Set<String>,
     onToggle: (String) -> Unit,
-    open: (String, String?) -> Unit
+    open: (String, String?, Boolean) -> Unit
 ) {
     val start = treeIndent(line.depth)
     val rowKey = section + ":" + line.path
@@ -100,7 +100,9 @@ private fun ChangeTreeRow(
                         change.workingKind == "conflicted" -> null
                         else -> "unstaged"
                     }
-                    open(change.path, scope)
+                    val deleted = if (section == "staged") change.stagedKind == "deleted"
+                        else change.workingKind == "deleted"
+                    open(change.path, scope, deleted)
                 }
             }
             .padding(start = start, end = 8.dp)
@@ -150,7 +152,7 @@ internal fun GitChangesTree(
     scroll: LazyListState,
     collapsed: List<String>,
     onToggle: (String) -> Unit,
-    open: (String, String?) -> Unit
+    open: (String, String?, Boolean) -> Unit
 ) {
     val staged = status.changes.filter { it.stagedKind != null }
     val working = status.changes.filter { it.workingKind != null }

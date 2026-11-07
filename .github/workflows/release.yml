@@ -54,6 +54,9 @@ jobs:
       - name: Test Windows app
         working-directory: desktop
         run: npm test
+      - name: Test Iroh transport
+        working-directory: desktop
+        run: npm run test:transport
       - name: Test renderer
         working-directory: renderer
         run: npm test
@@ -73,12 +76,14 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.PRISMO_ANDROID_KEYSTORE_BASE64 }}
           PRISMO_ANDROID_STORE_PASSWORD: ${{ secrets.PRISMO_ANDROID_STORE_PASSWORD }}
+          PRISMO_ANDROID_KEY_PASSWORD: ${{ secrets.PRISMO_ANDROID_STORE_PASSWORD }}
           PRISMO_ANDROID_KEY_ALIAS: ${{ secrets.PRISMO_ANDROID_KEY_ALIAS }}
         run: |
           if (-not $env:KEYSTORE_BASE64 -or -not $env:PRISMO_ANDROID_STORE_PASSWORD -or
-              -not $env:PRISMO_ANDROID_KEY_ALIAS) { throw 'Android release signing secrets are missing' }
+              -not $env:PRISMO_ANDROID_KEY_PASSWORD -or -not $env:PRISMO_ANDROID_KEY_ALIAS) {
+            throw 'Android release signing secrets are missing'
+          }
           $env:PRISMO_ANDROID_KEYSTORE = Join-Path $env:RUNNER_TEMP 'prismo-release.p12'
-          $env:PRISMO_ANDROID_KEY_PASSWORD = $env:PRISMO_ANDROID_STORE_PASSWORD
           [IO.File]::WriteAllBytes($env:PRISMO_ANDROID_KEYSTORE, [Convert]::FromBase64String($env:KEYSTORE_BASE64))
           try {
             .\gradlew.bat :app:assembleRelease --console=plain
@@ -126,6 +131,14 @@ jobs:
         with:
           name: prismo-release-assets
           path: release-assets
+      - name: Require license review for this release commit
+        env:
+          REVIEWED_SHA: ${{ vars.PRISMO_LICENSE_REVIEWED_SHA }}
+        run: |
+          if [ "$REVIEWED_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::Review final EXE/APK third-party notices, then set PRISMO_LICENSE_REVIEWED_SHA to this commit before publishing."
+            exit 1
+          fi
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,7 +147,7 @@ jobs:
           notes="Windows NSIS installer and portable EXE (both unsigned) plus signed Android APK. Windows SmartScreen may warn. Automatic Windows installation and updates require a trusted code-signing certificate; until then, use manual installation. Existing Android debug installations cannot be updated in place with the release APK. Real-device operation remains to be verified."
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
-            gh release edit "$GITHUB_REF_NAME" --title "Prismo $GITHUB_REF_NAME" --notes "$notes"
+            gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease=false --title "Prismo $GITHUB_REF_NAME" --notes "$notes"
           else
             gh release create "$GITHUB_REF_NAME" --verify-tag --title "Prismo $GITHUB_REF_NAME" --notes "$notes" release-assets/*
           fi

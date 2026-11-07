@@ -6,12 +6,13 @@ const ui = {
   closeSettings: element("close-settings-button"),
   loginStartup: element("login-startup-toggle"), loginStartupHint: element("login-startup-hint"),
   status: element("connection-status"),
-  empty: element("pair-placeholder"), message: element("pair-message"),
+  deviceList: element("device-list"),
   active: element("pair-active"), qr: element("qr-image"), countdown: element("countdown"),
+  pairLink: element("pair-link"),
   pair: element("pair-button"), pairLabel: element("pair-label"),
   cancel: element("cancel-pair-button"), copyLink: element("copy-pair-link-button"),
   refresh: element("refresh-button"),
-  devices: element("devices-count"), revoke: element("revoke-button"),
+  devices: element("devices-count"),
   add: element("add-button"), repoCount: element("repo-count"),
   list: element("repository-list"), toast: element("toast")
 };
@@ -36,9 +37,7 @@ function countdown() {
     + ":" + String(seconds % 60).padStart(2, "0");
   if (seconds === 0) {
     if (ui.active.open) ui.active.close();
-    ui.empty.hidden = false;
-    ui.message.textContent = "연결 코드 만료됨";
-    ui.pair.disabled = false;
+    ui.pair.hidden = false;
   }
 }
 function repositoryRow(repo) {
@@ -76,6 +75,44 @@ function repositoryRow(repo) {
   row.append(info, remove);
   return row;
 }
+function renderDevices(devices) {
+  const scroll = ui.deviceList.scrollTop;
+  ui.deviceList.replaceChildren();
+  if (!devices.length) {
+    const empty = document.createElement("div");
+    empty.className = "repo-empty";
+    empty.textContent = "등록된 기기 없음";
+    ui.deviceList.append(empty);
+  }
+  for (const device of devices) {
+    const row = document.createElement("div");
+    row.className = "repo-item";
+    const info = document.createElement("div");
+    info.className = "repo-meta";
+    const name = document.createElement("div");
+    name.className = "repo-name";
+    name.textContent = device.name;
+    const detail = document.createElement("div");
+    detail.className = "repo-detail";
+    detail.textContent = (device.online ? "온라인" : "오프라인") + " · "
+      + new Date(device.pairedAt).toLocaleDateString("ko-KR") + " 등록";
+    info.append(name, detail);
+    const remove = document.createElement("button");
+    remove.className = "repo-remove";
+    remove.title = "기기 연결 해제";
+    remove.setAttribute("aria-label", device.name + " 연결 해제");
+    remove.disabled = busy;
+    const icon = document.createElement("img");
+    icon.src = "./icons/trash-2.svg";
+    icon.alt = "";
+    remove.append(icon);
+    remove.addEventListener("click", () =>
+      perform(() => window.prismo.revokeDevice(device.id)));
+    row.append(info, remove);
+    ui.deviceList.append(row);
+  }
+  ui.deviceList.scrollTop = scroll;
+}
 function renderConnection(next) {
   const ready = next.running && next.connection.ready;
   const active = ready && next.pairing.active && next.pairing.expiresAt > Date.now();
@@ -89,34 +126,30 @@ function renderConnection(next) {
 
   if (active && !ui.active.open) ui.active.showModal();
   if (!active && ui.active.open) ui.active.close();
-  ui.empty.hidden = active;
   if (active) {
     ui.qr.src = next.pairing.qr;
+    ui.pairLink.value = next.pairing.link || "";
     countdown();
   } else {
     ui.qr.removeAttribute("src");
-    ui.message.textContent = !next.running ? "서버가 중지됨"
-      : next.connection.reason === "install" ? "연결 설정 필요"
-      : ready && next.connectedDevices > 0 ? "기기 연결됨"
-      : ready ? "새 기기를 연결하세요"
-      : "연결 설정 필요";
   }
   ui.pair.hidden = active;
-  ui.pair.disabled = busy || !next.running;
-  ui.pairLabel.textContent = ready ? "QR 생성" : "연결 설정";
+  ui.pair.disabled = busy || !ready;
+  ui.pairLabel.textContent = "새 기기 등록";
   ui.cancel.disabled = busy;
   ui.copyLink.disabled = busy;
   ui.refresh.disabled = busy;
-  ui.devices.textContent = "연결된 기기 " + next.connectedDevices + "대";
-  ui.revoke.hidden = next.connectedDevices === 0;
-  ui.revoke.disabled = busy;
+  ui.devices.textContent = String(next.connectedDevices);
+  renderDevices(next.devices || []);
 }
 function render(next) {
+  const previousServerError = state?.serverError;
   state = next;
   lastFullSync = Date.now();
   renderConnection(next);
   ui.add.disabled = busy;
   ui.repoCount.textContent = String(next.repositories.length);
+  const repoScroll = ui.list.scrollTop;
   ui.list.replaceChildren();
   if (next.repositories.length === 0) {
     const empty = document.createElement("div");
@@ -126,7 +159,8 @@ function render(next) {
   } else {
     next.repositories.forEach(repo => ui.list.append(repositoryRow(repo)));
   }
-  if (next.serverError) notify(next.serverError);
+  ui.list.scrollTop = repoScroll;
+  if (next.serverError && next.serverError !== previousServerError) notify(next.serverError);
 }
 function renderPairing(next) {
   if (!state) return;
@@ -159,7 +193,7 @@ async function refreshState() {
     const next = await window.prismo.state();
     if (!busy && revision === actionRevision) render(next);
   } catch {
-    notify("상태를 불러올 수 없습니다.");
+    if (!busy && revision === actionRevision) notify("상태를 불러올 수 없습니다.");
   } finally {
     refreshing = false;
     lastFullSync = Date.now();
@@ -203,11 +237,15 @@ window.prismo.onPCUpdate(result => {
   ui.pcUpdate.title = result.message;
   ui.pcUpdate.setAttribute("aria-label", "PC 업데이트: " + result.message);
 });
-ui.power.addEventListener("click", () => perform(() =>
-  state?.running ? window.prismo.stopServer() : window.prismo.startServer()
-));
+ui.power.addEventListener("click", () => perform(async () => {
+  if (state?.running) return window.prismo.stopServer();
+  const previousError = state?.serverError;
+  const next = await window.prismo.startServer();
+  if (next.serverError && next.serverError === previousError) notify(next.serverError);
+  return next;
+}));
 ui.pair.addEventListener("click", () => perform(() =>
-  state?.connection?.ready ? window.prismo.beginPairing() : window.prismo.setupConnection()
+  window.prismo.beginPairing()
 ));
 ui.cancel.addEventListener("click", () => perform(() => window.prismo.cancelPairing()));
 ui.copyLink.addEventListener("click", async () => {
@@ -220,7 +258,6 @@ ui.active.addEventListener("cancel", event => {
   event.preventDefault();
   perform(() => window.prismo.cancelPairing());
 });
-ui.revoke.addEventListener("click", () => perform(() => window.prismo.revokeDevices()));
 ui.refresh.addEventListener("click", () => perform(() => window.prismo.state()));
 ui.add.addEventListener("click", () => perform(() => window.prismo.addRepository()));
 refreshState();

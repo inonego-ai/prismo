@@ -1,20 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createServer } from "node:http";
 import { mkdir, mkdtemp, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { addRepository, listRepositories, removeRepository, repositoryRoot } from "../config.js";
 import { createApp } from "../api.js";
-import { getCommitDiff, getCommitFile, getCommitFiles, getCommits, getDiff, getRepositorySummaries, getStatus, parseStatus, readFileSnapshot, readImagePreview, readRepoFile, TreeStore } from "../git.js";
+import { getCommitDiff, getCommitFile, getCommitFileChanges, getCommits, getDiff, getRepositorySummaries, getStatus, parseStatus, readFileSnapshot, readImagePreview, readRepoFile, TreeStore } from "../git.js";
 import { PairingStore } from "../pairing.js";
 import { UpdateStore } from "../updates.js";
 
 const exec = promisify(execFile);
 const tempRoot = await realpath(tmpdir());
+const TEST_PEER = "a".repeat(64);
+const TEST_TOKEN = "A".repeat(43);
 async function git(cwd: string, args: string[]) {
   await exec("git", args, { cwd, timeout: 10000 });
 }
@@ -23,11 +23,10 @@ test("read-only repository registration and API behavior", async () => {
   const repoPath = join(base, "repo");
   process.env.PRISMO_CONFIG_DIR = join(base, "settings");
   const pairing = new PairingStore();
-  let privateConnection = true;
-  const app = createApp(pairing, new UpdateStore(), async () => privateConnection);
+  const app = createApp(pairing, new UpdateStore(), async () => true);
   let authToken = "";
   const inject = (request: { method: "GET"; url: string }) => app.inject({
-    ...request, headers: { authorization: "Bearer " + authToken }
+    ...request, headers: { authorization: "Bearer " + authToken, "x-prismo-peer": TEST_PEER }
   });
   try {
     await git(base, ["init", "-b", "main", repoPath]);
@@ -53,17 +52,18 @@ test("read-only repository registration and API behavior", async () => {
     const unauthorized = await inject({ method: "GET", url: "/api/v1/repositories" });
     assert.equal(unauthorized.statusCode, 401);
     const code = pairing.issue().secret;
-    const pairingResponse = await app.inject({ method: "POST", url: "/api/v1/pair", payload: { code } });
+    const pairingResponse = await app.inject({ method: "POST", url: "/api/v1/pair",
+      payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER } });
     assert.equal(pairingResponse.statusCode, 200);
-    authToken = pairingResponse.json().token;
+    assert.equal(pairingResponse.json().paired, true);
+    authToken = TEST_TOKEN;
     assert.equal(pairing.current(), null);
-    privateConnection = false;
-    assert.equal((await inject({ method: "GET", url: "/api/v1/repositories" })).statusCode, 503);
-    assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair",
-      payload: { code } })).statusCode, 503);
     assert.equal((await inject({ method: "GET", url: "/health" })).statusCode, 200);
-    privateConnection = true;
-    assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair", payload: { code } })).statusCode, 401);
+    assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair",
+      payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER } })).statusCode, 200);
+    assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair",
+      payload: { code, token: "B".repeat(43) },
+      headers: { "x-prismo-peer": TEST_PEER } })).statusCode, 401);
     const listing = await inject({ method: "GET", url: "/api/v1/repositories" });
     assert.deepEqual(listing.json().repositories, [{ id: registered.id, name: registered.name }]);
     const tree = await inject({ method: "GET", url: "/api/v1/repositories/" + registered.id + "/tree" });
@@ -82,6 +82,7 @@ test("read-only repository registration and API behavior", async () => {
     const changedInCommit = await inject({ method: "GET", url: prefix +
       "/commits/" + hash + "/files" });
     assert.deepEqual(changedInCommit.json().files, ["hello.ts"]);
+    assert.deepEqual(changedInCommit.json().deletedFiles, []);
     const historicalFile = await inject({ method: "GET", url: prefix +
       "/commits/" + hash + "/file?path=hello.ts" });
     assert.equal(historicalFile.json().content, "const before = 1;\n");
@@ -128,6 +129,10 @@ test("read-only repository registration and API behavior", async () => {
     await git(repoPath, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
       "commit", "-m", "Delete file"]);
     const { stdout: deletedHash } = await exec("git", ["rev-parse", "HEAD"], { cwd: repoPath });
+    const deletedListing = await inject({ method: "GET", url: prefix +
+      "/commits/" + deletedHash.trim() + "/files" });
+    assert.deepEqual(deletedListing.json().files, ["hello.ts"]);
+    assert.deepEqual(deletedListing.json().deletedFiles, ["hello.ts"]);
     const deletedAtCommit = await inject({ method: "GET", url: prefix +
       "/commits/" + deletedHash.trim() + "/file?path=hello.ts" });
     assert.equal(deletedAtCommit.statusCode, 200);
@@ -223,6 +228,8 @@ test("Git path arguments are literal and cannot expose protected files", async (
     await writeFile(join(path, ".env"), "SECRET=value\n");
     await writeFile(join(path, ".npmrc"), "//registry:token=secret\n");
     await writeFile(join(path, ".netrc"), "machine example login a password b\n");
+    const protectedNames = [".envrc", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk", "id_xmss"];
+    for (const name of protectedNames) await writeFile(join(path, name), "PRIVATE KEY\n");
     await writeFile(join(path, "entry[1].txt"), "before\n");
     await writeFile(join(path, "entry1.txt"), "unrelated\n");
     await git(path, ["add", "."]);
@@ -231,9 +238,16 @@ test("Git path arguments are literal and cannot expose protected files", async (
     const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: path });
     const repo = { id: "literal", name: "repo", path };
     assert.equal((await getCommitDiff(repo, stdout.trim(), ".e[n]v")).trim(), "");
-    assert.deepEqual(await getCommitFiles(repo, stdout.trim()), ["entry1.txt", "entry[1].txt"]);
+    assert.deepEqual((await getCommitFileChanges(repo, stdout.trim())).map(change => change.path),
+      ["entry1.txt", "entry[1].txt"]);
     await assert.rejects(getCommitFile(repo, stdout.trim(), ".npmrc"), { statusCode: 403 });
     await assert.rejects(getCommitFile(repo, stdout.trim(), ".netrc"), { statusCode: 403 });
+    for (const name of protectedNames) {
+      await assert.rejects(getCommitFile(repo, stdout.trim(), name), { statusCode: 403 });
+      await assert.rejects(readRepoFile(repo, name), { statusCode: 403 });
+    }
+    const visible = (await new TreeStore().list(repo)).entries.map(entry => entry.name);
+    assert.equal(protectedNames.some(name => visible.includes(name)), false);
     assert.equal(await getCommitFile(repo, stdout.trim(), "entry[1].txt"), "before\n");
     await writeFile(join(path, "entry[1].txt"), "after\n");
     const diff = await getDiff(repo, "entry[1].txt", "unstaged");
@@ -267,7 +281,8 @@ test("renamed files keep both paths in working and historical diffs", async () =
     await git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
       "commit", "-m", "Rename"]);
     const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: path });
-    assert.deepEqual(await getCommitFiles(repo, stdout.trim()), ["after.ts"]);
+    assert.deepEqual((await getCommitFileChanges(repo, stdout.trim())).map(change => change.path),
+      ["after.ts"]);
     const historical = await getCommitDiff(repo, stdout.trim(), "after.ts");
     assert.match(historical, /rename from before\.ts/);
     assert.match(historical, /rename to after\.ts/);
@@ -474,7 +489,7 @@ test("Git infrastructure errors retain their cause and do not mark valid reposit
     const originalPath = process.env.PATH;
     try {
       process.env.PATH = join(base, "no-git-executable");
-      await assert.rejects(getCommitFiles(repo, stdout.trim()), error => {
+      await assert.rejects(getCommitFileChanges(repo, stdout.trim()), error => {
         assert.notEqual((error as { statusCode?: number }).statusCode, 404);
         return true;
       });
@@ -510,14 +525,15 @@ test("Git executable failures return server errors rather than missing commits",
     try {
       const code = pairing.issue().secret;
       const paired = await app.inject({
-        method: "POST", url: "/api/v1/pair", payload: { code }
+        method: "POST", url: "/api/v1/pair",
+        payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER }
       });
       assert.equal(paired.statusCode, 200);
       process.env.PATH = join(base, "no-git-executable");
       const response = await app.inject({
         method: "GET",
         url: "/api/v1/repositories/" + registered.id + "/commits/" + stdout.trim() + "/files",
-        headers: { authorization: "Bearer " + paired.json().token }
+        headers: { authorization: "Bearer " + TEST_TOKEN, "x-prismo-peer": TEST_PEER }
       });
       assert.equal(response.statusCode, 500);
       assert.equal(response.json().error, "Internal server error");
@@ -553,8 +569,9 @@ test("commit endpoints reject hashes outside current HEAD history", async () => 
     await git(path, ["checkout", "main"]);
     await git(path, ["branch", "-D", "hidden"]);
     const repo = { id: "reachable", name: "repo", path };
-    assert.deepEqual(await getCommitFiles(repo, mainHead.trim()), ["base.txt"]);
-    await assert.rejects(getCommitFiles(repo, hidden), { statusCode: 404 });
+    assert.deepEqual((await getCommitFileChanges(repo, mainHead.trim())).map(change => change.path),
+      ["base.txt"]);
+    await assert.rejects(getCommitFileChanges(repo, hidden), { statusCode: 404 });
     await assert.rejects(getCommitDiff(repo, hidden, "hidden.txt"), { statusCode: 404 });
     await assert.rejects(getCommitFile(repo, hidden, "hidden.txt"), { statusCode: 404 });
     await assert.rejects(getCommits(repo, hidden + ":1"), { statusCode: 404 });
@@ -589,20 +606,25 @@ test("Git patches reject protected descendants during directory-to-file replacem
   }
 });
 
-test("pairing requests are bounded before private connection inspection", async () => {
+test("pairing attempts are limited per authenticated peer", async () => {
   const base = await mkdtemp(join(tempRoot, "prismo-pair-limit-"));
-  let checks = 0;
-  const app = createApp(new PairingStore(join(base, "paired.json")),
-    new UpdateStore(), async () => { checks++; return true; });
+  const pairing = new PairingStore(join(base, "paired.json"));
+  const app = createApp(pairing, new UpdateStore(), async () => true);
   try {
     for (let i = 0; i < 12; i++) {
       const response = await app.inject({ method: "POST", url: "/api/v1/pair",
-        payload: { code: "invalid" } });
+        payload: { code: "invalid", token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER } });
       assert.equal(response.statusCode, 401);
     }
     assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair",
-      payload: { code: "invalid" } })).statusCode, 429);
-    assert.equal(checks, 12);
+      payload: { code: "invalid", token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER } })).statusCode, 429);
+    const otherPeer = "b".repeat(64);
+    assert.equal((await app.inject({ method: "POST", url: "/api/v1/pair",
+      payload: { code: "invalid", token: TEST_TOKEN }, headers: { "x-prismo-peer": otherPeer } })).statusCode, 401);
+    const code = pairing.issue().secret;
+    const other = await app.inject({ method: "POST", url: "/api/v1/pair",
+      payload: { code, token: "B".repeat(43) }, headers: { "x-prismo-peer": otherPeer } });
+    assert.equal(other.statusCode, 200);
     assert.equal((await app.inject({ method: "GET", url: "/health" })).statusCode, 200);
   } finally {
     await app.close();
@@ -659,13 +681,14 @@ test("image API requires pairing and streams image bytes without text conversion
     const url = "/api/v1/repositories/" + repo.id + "/image?path=sample.png";
     assert.equal((await app.inject({ method: "GET", url })).statusCode, 401);
     const code = pairing.issue().secret;
+    const token = TEST_TOKEN;
     const response = await app.inject({
-      method: "POST", url: "/api/v1/pair", payload: { code }
+      method: "POST", url: "/api/v1/pair", payload: { code, token },
+      headers: { "x-prismo-peer": TEST_PEER }
     });
     assert.equal(response.statusCode, 200);
-    const token = response.json().token as string;
     const preview = await app.inject({
-      method: "GET", url, headers: { authorization: "Bearer " + token }
+      method: "GET", url, headers: { authorization: "Bearer " + token, "x-prismo-peer": TEST_PEER }
     });
     assert.equal(preview.statusCode, 200);
     assert.match(String(preview.headers["content-type"]), /image\/png/);
@@ -699,6 +722,40 @@ test("image previews preserve binary bytes across worktree, index and commits", 
     await writeFile(join(path, "sample.png"), "not an image");
     await assert.rejects(readImagePreview(repo, "sample.png"), { statusCode: 415 });
     await assert.rejects(readImagePreview(repo, ".env"), { statusCode: 403 });
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("commit changes distinguish deleted images from retained images", async () => {
+  const base = await mkdtemp(join(tempRoot, "prismo-deleted-image-"));
+  const path = join(base, "repo");
+  try {
+    await git(base, ["init", "-b", "main", path]);
+    const image = Buffer.from("89504e470d0a1a0a0000000d494844520000000100000001", "hex");
+    await writeFile(join(path, "removed.png"), image);
+    await writeFile(join(path, "retained.png"), image);
+    await git(path, ["add", "."]);
+    await git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "commit", "-m", "Images"]);
+    await unlink(join(path, "removed.png"));
+    const revised = Buffer.concat([image, Buffer.from([1])]);
+    await writeFile(join(path, "retained.png"), revised);
+    await git(path, ["add", "-A"]);
+    await git(path, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "commit", "-m", "Delete one image"]);
+    const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: path });
+    const hash = stdout.trim();
+    const repo = { id: "deleted-image", name: "repo", path };
+    const changes = await getCommitFileChanges(repo, hash);
+    assert.deepEqual(
+      Object.fromEntries(changes.map(change => [change.path, change.deleted])),
+      { "removed.png": true, "retained.png": false }
+    );
+    assert.deepEqual(changes.map(change => change.path), ["removed.png", "retained.png"]);
+    assert.equal(await readImagePreview(repo, "removed.png", "worktree", hash), null);
+    assert.deepEqual((await readImagePreview(repo, "retained.png", "worktree", hash))?.bytes, revised);
+    assert.match(await getCommitDiff(repo, hash, "removed.png"), /deleted file mode/);
   } finally {
     await rm(base, { recursive: true, force: true });
   }
@@ -814,7 +871,8 @@ test("merge commit changes are compared against the first parent", async () => {
       "merge", "--no-ff", "feature", "-m", "Merge feature"]);
     const { stdout } = await exec("git", ["rev-parse", "HEAD"], { cwd: path });
     const repo = { id: "history", name: "repo", path };
-    assert.deepEqual(await getCommitFiles(repo, stdout.trim()), ["feature.txt"]);
+    assert.deepEqual((await getCommitFileChanges(repo, stdout.trim())).map(change => change.path),
+      ["feature.txt"]);
     assert.match(await getCommitDiff(repo, stdout.trim(), "feature.txt"), /\+feature.txt/);
   } finally {
     await rm(base, { recursive: true, force: true });
@@ -836,36 +894,6 @@ test("commit history preserves separator characters in user-controlled metadata"
     assert.equal(result.commits[0]?.subject, subject);
     assert.equal(result.commits[0]?.author, author);
   } finally {
-    await rm(base, { recursive: true, force: true });
-  }
-});
-
-test("CLI status verifies Prismo health identity rather than HTTP 200 alone", async () => {
-  const base = await mkdtemp(join(tempRoot, "prismo-cli-health-"));
-  let service = "Other";
-  const server = createServer((_request, response) => {
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ service, status: "ok" }));
-  });
-  try {
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== "string");
-    const cli = fileURLToPath(new URL("../cli.js", import.meta.url));
-    const readStatus = async () => {
-      const { stdout } = await exec(process.execPath, [cli, "status", "--json"], {
-        env: { ...process.env, PRISMO_PORT: String(address.port),
-          PRISMO_CONFIG_DIR: base },
-        timeout: 5000
-      });
-      return JSON.parse(stdout) as { running: boolean };
-    };
-    assert.equal((await readStatus()).running, false);
-    service = "Prismo";
-    assert.equal((await readStatus()).running, true);
-  } finally {
-    await new Promise<void>((resolve, reject) =>
-      server.close(error => error ? reject(error) : resolve()));
     await rm(base, { recursive: true, force: true });
   }
 });

@@ -1,7 +1,7 @@
 {
   "name": "prismo",
   "productName": "Prismo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Prismo for Windows",
   "private": true,
   "type": "module",
@@ -9,6 +9,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test test/*.test.mjs",
+    "test:transport": "npm --prefix ../agent run build && node test/run-iroh-integration.mjs",
     "prepack": "node scripts/stage-agent.mjs",
     "preportable": "node scripts/stage-agent.mjs",
     "preinstaller": "node scripts/stage-agent.mjs",
@@ -17,6 +18,7 @@
     "installer": "electron-builder --win nsis --config electron-builder.release.cjs --publish never"
   },
   "dependencies": {
+    "@number0/iroh": "1.2.0",
     "electron-updater": "^6.8.11",
     "qrcode": "^1.5.4"
   },
@@ -36,7 +38,8 @@
       "index.html",
       "style.css",
       "renderer.mjs",
-      "connection.mjs",
+      "iroh.mjs",
+      "transport-log.mjs",
       "login-startup.mjs",
       "update-check.mjs",
       "mark.svg",
@@ -54,6 +57,7 @@
           "api.js",
           "config.js",
           "git.js",
+          "git-executor.js",
           "pairing.js",
           "releaseConfig.js",
           "updates.js"

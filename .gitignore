@@ -22,6 +22,7 @@ android/app/src/main/assets/renderer-licenses.txt
 android/app/src/main/assets/android-library-notices.txt
 desktop/release*/
 desktop/.runtime/
+desktop/.dev-profile/
 renderer/build/
 *.iml
 .DS_Store

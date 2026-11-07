@@ -44,6 +44,9 @@ jobs:
       - name: Test Windows app
         working-directory: desktop
         run: npm test
+      - name: Test Iroh transport
+        working-directory: desktop
+        run: npm run test:transport
       - name: Test renderer
         working-directory: renderer
         run: npm test

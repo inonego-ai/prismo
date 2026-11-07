@@ -1,5 +1,7 @@
 package dev.prismo.app
 
+import android.content.Context
+import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.ResponseBody
 import retrofit2.Call
@@ -14,8 +16,8 @@ import retrofit2.http.Streaming
 import java.util.concurrent.TimeUnit
 
 data class Health(val service: String, val status: String, val version: Int)
-data class PairRequest(val code: String)
-data class PairResponse(val token: String)
+data class PairRequest(val code: String, val name: String, val token: String)
+data class PairResponse(val paired: Boolean)
 data class AppUpdate(val packageName: String, val versionCode: Long,
                      val versionName: String, val size: Long, val sha256: String)
 data class AppUpdateResponse(val configured: Boolean, val update: AppUpdate?)
@@ -32,7 +34,7 @@ data class FileData(val path: String, val content: String?)
 data class DiffData(val path: String, val diff: String)
 data class Commit(val hash: String, val subject: String, val author: String, val date: String)
 data class CommitList(val commits: List<Commit>, val nextCursor: String?)
-data class CommitFiles(val files: List<String>)
+data class CommitFiles(val files: List<String>, val deletedFiles: List<String>)
 
 interface PrismoAPI {
     @GET("health") suspend fun health(): Health
@@ -51,9 +53,9 @@ interface PrismoAPI {
                      @Query("revision") revision: String? = null): FileData
     @Streaming
     @GET("api/v1/repositories/{id}/image")
-    suspend fun image(@Path("id") id: String, @Query("path") path: String,
-                      @Query("revision") revision: String? = null,
-                      @Query("commit") commit: String? = null): ResponseBody
+    fun image(@Path("id") id: String, @Query("path") path: String,
+              @Query("revision") revision: String? = null,
+              @Query("commit") commit: String? = null): Call<ResponseBody>
     @GET("api/v1/repositories/{id}/diff")
     suspend fun diff(@Path("id") id: String, @Query("scope") scope: String,
                      @Query("path") path: String, @Query("full") full: Boolean): DiffData
@@ -69,23 +71,35 @@ interface PrismoAPI {
     suspend fun commitDiff(@Path("id") id: String, @Path("hash") hash: String,
                            @Query("path") path: String, @Query("full") full: Boolean): DiffData
 }
-object PrismoClient {
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .build()
-    fun create(url: String, token: String = ""): PrismoAPI {
-        val client = if (token.isBlank()) http else http.newBuilder()
+internal class PrismoConnection(val api: PrismoAPI, private val transport: IrohTransport) {
+    fun close() = transport.close()
+}
+
+internal object PrismoClient {
+    fun create(context: Context, pcID: String, token: String = ""): PrismoConnection {
+        val transport = IrohTransport(context.applicationContext, pcID)
+        val client = OkHttpClient.Builder()
+            .eventListenerFactory {
+                object : EventListener() {
+                    override fun canceled(call: okhttp3.Call) { transport.cancel(call) }
+                }
+            }
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(40, TimeUnit.SECONDS)
             .addInterceptor { chain ->
-                val request = chain.request().newBuilder()
-                    .header("Authorization", "Bearer $token").build()
+                val request = if (token.isBlank()) chain.request() else
+                    chain.request().newBuilder()
+                        .header("Authorization", "Bearer $token").build()
                 chain.proceed(request)
-            }.build()
-        return Retrofit.Builder()
-            .baseUrl(url.trimEnd('/') + "/")
+            }
+            .addInterceptor(transport)
+            .build()
+        val api = Retrofit.Builder()
+            .baseUrl("https://prismo.invalid/")
             .client(client)
             .addConverterFactory(GsonConverterFactory.create())
             .build()
             .create(PrismoAPI::class.java)
+        return PrismoConnection(api, transport)
     }
 }

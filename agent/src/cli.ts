@@ -19,26 +19,11 @@ async function run() {
       present({ removed: await removeRepository(value) }); break;
     case "list":
       present({ repositories: await listRepositories() }); break;
-    case "status": {
-      try {
-        const response = await fetch("http://127.0.0.1:" +
-          (process.env.PRISMO_PORT ?? "3000") + "/health",
-          { signal: AbortSignal.timeout(1500) });
-        const health = response.ok
-          ? await response.json() as { service?: string; status?: string } : null;
-        present({ running: health?.service === "Prismo" && health?.status === "ok",
-          repositories: (await listRepositories()).length });
-      } catch {
-        present({ running: false, repositories: (await listRepositories()).length });
-      }
-      break;
-    }
     default:
       present("Prismo CLI\n" +
         "  prismo add [path] [--json]\n" +
         "  prismo remove <id> [--json]\n" +
         "  prismo list [--json]\n" +
-        "  prismo status [--json]\n" +
         "  기기 연결 QR은 PC 앱에서만 생성할 수 있습니다.");
   }
 }

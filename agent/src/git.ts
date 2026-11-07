@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
+import { executeGit, GIT_PARALLELISM } from "./git-executor.js";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, open, opendir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Repository } from "./config.js";
 
@@ -10,32 +11,12 @@ const exec = promisify(execFile);
 const MAX_GIT = 2 * 1024 * 1024;
 const MAX_FILE = 512 * 1024;
 const MAX_IMAGE = 16 * 1024 * 1024;
-const MAX_ACTIVE_GIT = 4;
-const MAX_PENDING_GIT = 32;
-let activeGit = 0;
-const waitingGit: Array<() => void> = [];
-async function withGitSlot<T>(operation: () => Promise<T>): Promise<T> {
-  if (activeGit >= MAX_ACTIVE_GIT) {
-    if (waitingGit.length >= MAX_PENDING_GIT) {
-      throw new AccessError("Git service is busy", 429);
-    }
-    await new Promise<void>(resolve => waitingGit.push(resolve));
-  } else {
-    activeGit++;
-  }
-  try {
-    return await operation();
-  } finally {
-    const next = waitingGit.shift();
-    if (next) next();
-    else activeGit--;
-  }
-}
-const protectedPart = /^(?:\.git|\.env(?:\..*)?|\.ssh|\.aws|\.azure|\.kube|\.gnupg|\.docker|\.npmrc|\.netrc|\.pypirc|\.git-credentials|id_(?:rsa|dsa|ed25519)|credentials(?:\..*)?|secrets?(?:\..*)?)$/i;
+const protectedPart = /^(?:\.git|\.env(?:\..*)?|\.envrc|\.ssh|\.aws|\.azure|\.kube|\.gnupg|\.docker|\.npmrc|\.netrc|\.pypirc|\.git-credentials|id_(?:rsa|dsa|ecdsa(?:_sk)?|ed25519(?:_sk)?|xmss)(?:[._~-](?!pub$)[^/\\]*)?|credentials(?:\..*)?|secrets?(?:\..*)?)$/i;
 const protectedExtension = /\.(?:pem|p12|pfx|key|keystore|tfstate|tfvars)$/i;
 export class AccessError extends Error {
   constructor(message: string, public readonly statusCode = 400) { super(message); }
 }
+
 export function isProtectedPath(path: string): boolean {
   return path.split(/[\\/]/).some(part => {
     const name = part.replace(/[. ]+$/, "");
@@ -137,10 +118,38 @@ async function gitTextOptions(root: string): Promise<string[]> {
   try { return await options; }
   catch (error) { textOptionCache.delete(root); throw error; }
 }
+// A repository may define executable clean/process filters in local Git config.
+// Read those driver names without executing Git worktree operations, then disable
+// every discovered driver for the single read-only command.
+async function disabledGitFilters(root: string): Promise<string[]> {
+  let output: string;
+  try {
+    const result = await exec("git", ["config", "--local", "--includes",
+      "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process)$"], {
+      cwd: root, encoding: "utf8", timeout: 5000, maxBuffer: 65536,
+      windowsHide: true, env: gitEnvironment()
+    });
+    output = result.stdout;
+  } catch (error) {
+    if ((error as { code?: number }).code === 1) return [];
+    throw error;
+  }
+  const drivers = new Set<string>();
+  for (const key of output.split("\0")) {
+    const match = /^filter\.(.+)\.(?:clean|process)$/i.exec(key);
+    if (match) drivers.add(match[1]!);
+  }
+  return [...drivers].flatMap(name => [
+    "-c", `filter.${name}.clean=`,
+    "-c", `filter.${name}.process=`,
+    "-c", `filter.${name}.required=false`
+  ]);
+}
 async function runGit(
   cwd: string, args: string[], workTreeRoot?: string, binary = false
 ): Promise<string | Buffer> {
-  return withGitSlot(async () => {
+  return executeGit(async signal => {
+    signal.throwIfAborted();
     const root = await safePath(cwd);
     let workTree: string | undefined;
     if (workTreeRoot !== undefined) {
@@ -158,16 +167,19 @@ async function runGit(
         throw new AccessError("Invalid Git metadata", 403);
       }
     }
-    const textOptions = await gitTextOptions(root);
+    const [textOptions, disabledFilters] = await Promise.all([
+      gitTextOptions(root), disabledGitFilters(root)
+    ]);
+    signal.throwIfAborted();
     const result = await exec("git", [
-      ...textOptions,
+      ...textOptions, ...disabledFilters,
       ...(workTree ? ["-c", "core.bare=false", "--work-tree=" + workTree] : []),
       "-c", "core.pager=cat", "-c", "diff.external=", "-c", "core.fsmonitor=false",
       "--no-pager", ...args
     ], {
       cwd: root, encoding: binary ? "buffer" : "utf8", timeout: 5000,
       maxBuffer: binary ? MAX_IMAGE + 65536 : MAX_GIT, windowsHide: true,
-      env: gitEnvironment()
+      env: gitEnvironment(), signal
     });
     return result.stdout;
   });
@@ -245,8 +257,8 @@ export async function getStatus(repo: Repository, includeUntracked = true): Prom
 type RepoIssue = "unavailable" | "temporary";
 export async function getRepositorySummaries(repositories: Repository[]) {
   const summaries: Array<{ repo: Repository; status: RepoStatus | null; issue: RepoIssue | null }> = [];
-  for (let index = 0; index < repositories.length; index += MAX_ACTIVE_GIT) {
-    const batch = await Promise.all(repositories.slice(index, index + MAX_ACTIVE_GIT)
+  for (let index = 0; index < repositories.length; index += GIT_PARALLELISM) {
+    const batch = await Promise.all(repositories.slice(index, index + GIT_PARALLELISM)
       .map(async repo => {
         try {
           return { repo, status: await getStatus(repo), issue: null };
@@ -333,15 +345,18 @@ export class TreeStore {
       snapshot = existing;
     } else {
       const root = await safePath(repo.path, path);
-      const source = await readdir(root, { withFileTypes: true });
-      if (source.length > MAX_TREE_ENTRIES) throw new AccessError("Directory too large", 413);
-      const entries = source.filter(item => !item.isSymbolicLink() && !isProtectedPath(item.name))
-        .map(item => ({
+      const entries: TreeEntry[] = [];
+      let count = 0;
+      for await (const item of await opendir(root)) {
+        if (++count > MAX_TREE_ENTRIES) throw new AccessError("Directory too large", 413);
+        if (item.isSymbolicLink() || isProtectedPath(item.name)) continue;
+        entries.push({
           name: item.name, path: path ? path + "/" + item.name : item.name,
           directory: item.isDirectory()
-        }))
-        .sort((a, b) => Number(b.directory) - Number(a.directory)
-          || a.name.localeCompare(b.name));
+        });
+      }
+      entries.sort((a, b) => Number(b.directory) - Number(a.directory)
+        || a.name.localeCompare(b.name));
       key = randomBytes(16).toString("hex");
       snapshot = { repoID: repo.id, path, expiresAt: now + TREE_SNAPSHOT_MS, entries };
       if (entries.length > TREE_PAGE_SIZE) {
@@ -486,7 +501,7 @@ async function commitParents(repo: Repository, hash: string): Promise<string[]> 
   }
   return parents.slice(1);
 }
-type CommitChange = { path: string; previousPath?: string };
+type CommitChange = { path: string; previousPath?: string; deleted: boolean };
 async function commitChanges(repo: Repository, hash: string, parents: string[]): Promise<CommitChange[]> {
   const raw = parents[0]
     ? await execRepoGit(repo, ["diff", "--no-ext-diff", "--no-textconv",
@@ -502,7 +517,7 @@ async function commitChanges(repo: Repository, hash: string, parents: string[]):
     const path = fields[i++];
     if (!path) throw new AccessError("Invalid commit change path", 500);
     if (!isProtectedPath(path) && (!previousPath || !isProtectedPath(previousPath))) {
-      changes.push({ path, ...(previousPath ? { previousPath } : {}) });
+      changes.push({ path, ...(previousPath ? { previousPath } : {}), deleted: status === "D" });
     }
   }
   return changes;
@@ -628,7 +643,7 @@ export async function readImagePreview(
   }
   return { bytes, contentType: imageContentType(path, bytes) };
 }
-export async function getCommitFiles(repo: Repository, hash: string): Promise<string[]> {
+export async function getCommitFileChanges(repo: Repository, hash: string): Promise<CommitChange[]> {
   const parents = await commitParents(repo, hash);
-  return (await commitChanges(repo, hash, parents)).map(change => change.path);
+  return commitChanges(repo, hash, parents);
 }

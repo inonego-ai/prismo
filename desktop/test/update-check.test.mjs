@@ -53,16 +53,16 @@ test("releases the check gate after a failed check", async () => {
 const source = { owner: "inonego-ai", repo: "prismo" };
 
 test("compares release versions numerically", () => {
-  assert.equal(compareReleaseVersions("0.1.0", "v0.1.1"), 1);
+  assert.equal(compareReleaseVersions("0.2.0", "v0.2.1"), 1);
   assert.equal(compareReleaseVersions("0.9.0", "v0.10.0"), 1);
-  assert.equal(compareReleaseVersions("0.1.0", "v0.1.0"), 0);
-  assert.equal(compareReleaseVersions("0.2.0", "v0.1.0"), -1);
-  assert.equal(compareReleaseVersions("invalid", "v0.1.0"), null);
+  assert.equal(compareReleaseVersions("0.2.0", "v0.2.0"), 0);
+  assert.equal(compareReleaseVersions("0.3.0", "v0.2.0"), -1);
+  assert.equal(compareReleaseVersions("invalid", "v0.2.0"), null);
 });
 
 test("reports missing public releases instead of opening a browser", async () => {
   const calls = [];
-  const result = await checkLatestGitHubRelease(source, "0.1.0", async (url, options) => {
+  const result = await checkLatestGitHubRelease(source, "0.2.0", async (url, options) => {
     calls.push({ url, options });
     return new Response(null, { status: 404 });
   });
@@ -72,21 +72,21 @@ test("reports missing public releases instead of opening a browser", async () =>
 
 test("reports available and current releases", async () => {
   const fetcher = async () => new Response(
-    JSON.stringify({ draft: false, prerelease: false, tag_name: "v0.2.0" }),
+    JSON.stringify({ draft: false, prerelease: false, tag_name: "v0.3.0" }),
     { status: 200 }
   );
-  assert.equal((await checkLatestGitHubRelease(source, "0.1.0", fetcher)).kind, "available");
-  assert.equal((await checkLatestGitHubRelease(source, "0.2.0", fetcher)).kind, "current");
+  assert.equal((await checkLatestGitHubRelease(source, "0.2.0", fetcher)).kind, "available");
   assert.equal((await checkLatestGitHubRelease(source, "0.3.0", fetcher)).kind, "current");
+  assert.equal((await checkLatestGitHubRelease(source, "0.4.0", fetcher)).kind, "current");
 });
 
 test("rejects unsupported release metadata and propagates fetch errors", async () => {
   const invalid = async () => new Response(
     JSON.stringify({ draft: false, prerelease: false, tag_name: "unsafe" }), { status: 200 }
   );
-  assert.equal((await checkLatestGitHubRelease(source, "0.1.0", invalid)).kind, "error");
+  assert.equal((await checkLatestGitHubRelease(source, "0.2.0", invalid)).kind, "error");
   await assert.rejects(
-    checkLatestGitHubRelease(source, "0.1.0", async () => new Response(null, { status: 403 })),
+    checkLatestGitHubRelease(source, "0.2.0", async () => new Response(null, { status: 403 })),
     /403/
   );
 });

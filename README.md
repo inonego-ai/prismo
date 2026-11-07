@@ -1,6 +1,6 @@
 # Prismo
 
-[![Version](https://img.shields.io/badge/version-0.1.0-6366f1)](https://github.com/inonego-ai/prismo)
+[![Version](https://img.shields.io/badge/version-0.2.0-6366f1)](https://github.com/inonego-ai/prismo)
 [![CI](https://github.com/inonego-ai/prismo/actions/workflows/ci.yml/badge.svg)](https://github.com/inonego-ai/prismo/actions/workflows/ci.yml)
 [![Read-only](https://img.shields.io/badge/access-read--only-10b981)](#features)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -17,7 +17,7 @@ View your PC's Git repositories from your Android device, without pushing or clo
 - Browse repositories, folders, and files.
 - Review staged, unstaged, and untracked changes with diffs.
 - Explore commit history and changed files.
-- Connect devices with a one-time QR code over a private connection.
+- Pair Android devices using a one-time QR code and authenticated Iroh QUIC connections, with direct paths or encrypted relays.
 - Restrict access to common sensitive paths.
 - Optionally start the Windows desktop agent at login from the Settings menu (tray-only startup).
 
@@ -25,7 +25,8 @@ Git access is read-only. Connections authenticate both the Iroh peer identity an
 
 ## Build from source
 
-From the project root, build the Windows app:
+From the project root, build the Windows app. Git for Windows must be installed and
+`git.exe` available on `PATH` at runtime; Prismo uses the external Git CLI to read repositories.
 
 ```powershell
 cd agent

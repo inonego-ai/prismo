@@ -1,9 +1,10 @@
 package dev.prismo.app
 
-import android.net.Uri
 import android.os.Bundle
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import computer.iroh.IrohAndroid
 import androidx.compose.foundation.Image
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -12,10 +13,14 @@ import kotlinx.coroutines.withContext
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -41,17 +46,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.flow.map
 import java.net.URI
+import java.io.IOException
+import java.security.SecureRandom
+import android.util.Base64
 import retrofit2.HttpException
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        IrohAndroid.installAndroidContext(applicationContext)
         setContent { PrismoApp() }
     }
 }
@@ -64,14 +76,15 @@ private val darkScheme = darkColorScheme(
     secondaryContainer = Color(0xFF292929), onSecondaryContainer = Color(0xFFEAEAEA)
 )
 private data class ReaderTarget(
-    val path: String, val scope: String? = null, val commit: String? = null
+    val path: String, val scope: String? = null, val commit: String? = null,
+    val deleted: Boolean = false
 )
 private sealed interface UpdateState {
     data object Checking : UpdateState
     data object Unconfigured : UpdateState
     data object NotPublished : UpdateState
     data object Current : UpdateState
-    data object Failed : UpdateState
+    data class Failed(val message: String, val info: AppUpdate? = null) : UpdateState
     data class Available(val info: AppUpdate) : UpdateState
     data class PermissionRequired(val info: AppUpdate) : UpdateState
     data object Downloading : UpdateState
@@ -94,6 +107,22 @@ private enum class Tab(val title: String, val icon: ImageVector) {
     Files("파일", Icons.Outlined.FolderOpen),
     History("기록", Icons.Outlined.History)
 }
+private class HistoryState(refresh: Int) {
+    val commits = mutableStateOf<List<Commit>>(emptyList())
+    val cursor = mutableStateOf<String?>(null)
+    val nextCursor = mutableStateOf<String?>(null)
+    val loading = mutableStateOf(false)
+    val selectedHash = mutableStateOf<String?>(null)
+    val selectedFiles = mutableStateOf<Pair<String, CommitFiles>?>(null)
+    val pageError = mutableStateOf<String?>(null)
+    val fileError = mutableStateOf<String?>(null)
+    val reload = mutableIntStateOf(0)
+    val fileReload = mutableIntStateOf(0)
+    val pageRequestId = mutableIntStateOf(0)
+    val loadedPageRequestId = mutableIntStateOf(-1)
+    val loadedRefresh = mutableIntStateOf(refresh)
+    val scroll = LazyListState()
+}
 @Composable
 private fun PrismoApp() {
     val context = LocalContext.current
@@ -107,17 +136,25 @@ private fun PrismoApp() {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
-            } else if (prefs.pcURL.isBlank() || prefs.deviceToken.isBlank()) {
+            } else if (!Regex("[0-9a-f]{64}").matches(prefs.pcID) || prefs.deviceToken.isBlank()) {
                 PairingScreen { url, token ->
-                    scope.launch { context.updateViewerPreferences { it.copy(pcURL = url, deviceToken = token) } }
+                    scope.launch {
+                        context.updateViewerPreferences {
+                            it.copy(pcID = url, deviceToken = token)
+                        }
+                        PairingAttempt.clear(context)
+                    }
                 }
             } else {
-                val api = remember(prefs.pcURL, prefs.deviceToken) {
-                    PrismoClient.create(prefs.pcURL, prefs.deviceToken)
+                val connection = remember(prefs.pcID, prefs.deviceToken) {
+                    PrismoClient.create(context, prefs.pcID, prefs.deviceToken)
                 }
-                key(prefs.pcURL, prefs.deviceToken) {
+                DisposableEffect(connection) {
+                    onDispose { connection.close() }
+                }
+                key(prefs.pcID, prefs.deviceToken) {
                     RepositoryHome(
-                        api = api, prefs = prefs,
+                        api = connection.api, prefs = prefs,
                         onPrefs = { change ->
                             scope.launch { context.updateViewerPreferences(change) }
                         }
@@ -127,20 +164,42 @@ private fun PrismoApp() {
         }
     }
 }
-private data class PairCode(val address: String, val secret: String)
+private data class PairCode(val pcID: String, val secret: String)
 private fun parsePairCode(input: String): PairCode {
     val uri = URI(input.trim())
-    require(uri.scheme == "https" && uri.host?.endsWith(".ts.net", ignoreCase = true) == true
-        && uri.port == -1 && uri.userInfo == null && uri.rawQuery == null
+    require(uri.scheme == "prismo" && uri.host == "pair"
+        && uri.port == -1 && uri.userInfo == null && uri.rawFragment == null
         && (uri.path.isNullOrBlank() || uri.path == "/")) {
         "올바른 QR 코드가 아닙니다."
     }
-    val fragment = uri.rawFragment.orEmpty()
-    require(fragment.startsWith("pair=")) { "올바른 QR 코드가 아닙니다." }
-    val secret = fragment.removePrefix("pair=")
-    require(Regex("[A-Za-z0-9_-]{43}").matches(secret)) { "올바른 QR 코드가 아닙니다." }
-    return PairCode(uri.scheme + "://" + uri.authority, secret)
+    val entries = uri.rawQuery?.split("&")?.map { it.split("=", limit = 2) }.orEmpty()
+    require(entries.size == 3 && entries.all { it.size == 2 }) {
+        "올바른 연결 주소가 아닙니다."
+    }
+    val fields = entries.associate { it[0] to it[1] }
+    val pc = fields["pc"].orEmpty()
+    val secret = fields["code"].orEmpty()
+    require(fields.size == 3 && fields["v"] == "1" &&
+        Regex("[0-9a-f]{64}").matches(pc) &&
+        Regex("[A-Za-z0-9_-]{43}").matches(secret)) {
+        "올바른 연결 주소가 아닙니다."
+    }
+    return PairCode(pc, secret)
 }
+private suspend fun verifyPairing(context: Context, pcID: String, token: String): Boolean {
+    val connection = PrismoClient.create(context, pcID, token)
+    return try {
+        connection.api.repositories()
+        true
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        false
+    } finally {
+        connection.close()
+    }
+}
+
 @Composable
 private fun PairingScreen(onConnected: (String, String) -> Unit) {
     val context = LocalContext.current
@@ -149,22 +208,57 @@ private fun PairingScreen(onConnected: (String, String) -> Unit) {
     var busy by remember { mutableStateOf(false) }
     var showManual by rememberSaveable { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var ongoing by remember { mutableStateOf<Job?>(null) }
+    LaunchedEffect(Unit) {
+        val pending = PairingAttempt.read(context)
+        if (pending != null) {
+            busy = true
+            try {
+                if (verifyPairing(context, pending.first, pending.second)) {
+                    onConnected(pending.first, pending.second)
+                }
+            } finally {
+                busy = false
+            }
+        }
+    }
     fun connect(raw: String) {
         if (busy) return
         busy = true
         error = null
-        scope.launch {
+        ongoing = scope.launch {
             try {
                 val pairing = parsePairCode(raw)
-                val api = PrismoClient.create(pairing.address)
-                require(api.health().service == "Prismo") { "연결할 수 없습니다." }
-                val response = api.pair(PairRequest(pairing.secret))
-                onConnected(pairing.address, response.token)
+                val connection = PrismoClient.create(context, pairing.pcID)
+                try {
+                    val api = connection.api
+                    require(api.health().service == "Prismo") { "연결할 수 없습니다." }
+                    val deviceName = android.provider.Settings.Global.getString(
+                        context.contentResolver, android.provider.Settings.Global.DEVICE_NAME)
+                        ?.takeIf { it.isNotBlank() } ?: android.os.Build.MODEL
+                    val secret = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                    val token = Base64.encodeToString(secret,
+                        Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                    PairingAttempt.save(context, pairing.pcID, token)
+                    val paired = try {
+                        api.pair(PairRequest(pairing.secret, deviceName, token)).paired
+                    } catch (error: IOException) {
+                        if (!verifyPairing(context, pairing.pcID, token)) throw error
+                        true
+                    }
+                    check(paired) { "Pairing was not accepted" }
+                    onConnected(pairing.pcID, token)
+                } finally {
+                    connection.close()
+                }
             } catch (exception: CancellationException) {
                 throw exception
-            } catch (exception: Exception) {
+            } catch (_: Exception) {
                 error = "연결할 수 없습니다."
-            } finally { busy = false }
+            } finally {
+                busy = false
+                ongoing = null
+            }
         }
     }
     Column(
@@ -198,6 +292,9 @@ private fun PairingScreen(onConnected: (String, String) -> Unit) {
             Button(onClick = { connect(input) }, enabled = !busy && input.isNotBlank(),
                 modifier = Modifier.fillMaxWidth()) { Text("연결") }
         }
+        if (busy && ongoing != null) {
+            TextButton(onClick = { ongoing?.cancel() }) { Text("연결 취소") }
+        }
         ErrorText(error)
     }
 }
@@ -214,10 +311,29 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
     var targetPath by rememberSaveable { mutableStateOf<String?>(null) }
     var targetScope by rememberSaveable { mutableStateOf<String?>(null) }
     var targetCommit by rememberSaveable { mutableStateOf<String?>(null) }
-    val target = targetPath?.let { ReaderTarget(it, targetScope, targetCommit) }
+    var targetDeleted by rememberSaveable { mutableStateOf(false) }
+    val target = targetPath?.let { ReaderTarget(it, targetScope, targetCommit, targetDeleted) }
     var refresh by rememberSaveable { mutableIntStateOf(0) }
-    val changesScroll = androidx.compose.foundation.lazy.rememberLazyListState()
-    val filesScroll = androidx.compose.foundation.lazy.rememberLazyListState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        var wasPaused = false
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> wasPaused = true
+                Lifecycle.Event.ON_RESUME -> if (wasPaused) {
+                    wasPaused = false
+                    refresh++
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val changesScroll = key(selectedID) { androidx.compose.foundation.lazy.rememberLazyListState() }
+    val filesScroll = key(selectedID) { androidx.compose.foundation.lazy.rememberLazyListState() }
+    val history = remember(selectedID) { HistoryState(refresh) }
+    val fileTree = remember(api, selectedID, refresh) { FileTreeState() }
     var collapsedChanges by rememberSaveable(selectedID) { mutableStateOf(emptyList<String>()) }
     var expandedFiles by rememberSaveable(selectedID) { mutableStateOf(emptyList<String>()) }
     fun toggleChangeFolder(path: String) {
@@ -228,15 +344,18 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
         expandedFiles = if (path in expandedFiles) expandedFiles - path
             else expandedFiles + path
     }
-    fun openReader(path: String, scope: String? = null, commit: String? = null) {
+    fun openReader(path: String, scope: String? = null, commit: String? = null,
+                   deleted: Boolean = false) {
         targetPath = path
         targetScope = scope
         targetCommit = commit
+        targetDeleted = deleted
     }
     fun closeReader() {
         targetPath = null
         targetScope = null
         targetCommit = null
+        targetDeleted = false
     }
     var error by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(api, refresh) {
@@ -249,15 +368,13 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
             }
             error = null
         } catch (e: CancellationException) { throw e }
-        catch (e: HttpException) {
-            if (e.code() == 401) {
-                repos = emptyList()
-                selectedID = null
-                closeReader()
-                onPrefs { it.copy(pcURL = "", deviceToken = "") }
-            } else error = "저장소를 불러올 수 없습니다."
-        } catch (_: Exception) {
-            error = "PC에 연결할 수 없습니다."
+        catch (e: Exception) {
+            when {
+                e is HttpException && e.code() == 401 ->
+                    onPrefs { it.copy(pcID = "", deviceToken = "") }
+                e is HttpException -> error = "저장소를 불러올 수 없습니다."
+                else -> error = "PC에 연결할 수 없습니다."
+            }
         } finally { initialLoad = false }
     }
     val activeRepo = repos.find { it.id == selectedID }
@@ -275,7 +392,7 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
         return
     }
     if (activeRepo != null && target != null) {
-        ReaderPage(api, activeRepo.id, target, prefs, onBack = { closeReader() })
+        ReaderPage(api, activeRepo.id, target, prefs, refresh, onBack = { closeReader() })
         return
     }
     Scaffold(
@@ -321,22 +438,22 @@ private fun RepositoryHome(api: PrismoAPI, prefs: ViewerPreferences,
             if (showingSettings) {
                 SettingsPage(api, prefs, onPrefs)
             } else if (activeRepo == null) {
-                RepoListPage(api, repos, prefs.pcURL) { repo ->
+                RepoListPage(api, repos, refresh) { repo ->
                     selectedID = repo.id
                     closeReader()
                     tabName = Tab.Changes.name
                 }
             } else when (tab) {
                 Tab.Changes -> ChangesPage(api, activeRepo.id, refresh,
-                    changesScroll, collapsedChanges, ::toggleChangeFolder) { path, scope ->
-                    openReader(path, scope)
+                    changesScroll, collapsedChanges, ::toggleChangeFolder) { path, scope, deleted ->
+                    openReader(path, scope, deleted = deleted)
                 }
                 Tab.Files -> GitFilesTree(api, activeRepo.id, refresh,
-                    filesScroll, expandedFiles, ::toggleFileFolder) { path ->
+                    fileTree, filesScroll, expandedFiles, ::toggleFileFolder) { path ->
                     openReader(path)
                 }
-                Tab.History -> HistoryPage(api, activeRepo.id, refresh) { path, hash ->
-                    openReader(path, commit = hash)
+                Tab.History -> HistoryPage(api, activeRepo.id, refresh, history) { path, hash, deleted ->
+                    openReader(path, commit = hash, deleted = deleted)
                 }
             }
         }
@@ -352,23 +469,23 @@ private fun ErrorText(error: String?) {
 }
 @Composable
 private fun RepoListPage(
-    api: PrismoAPI, repos: List<RepoSummary>, url: String, open: (RepoSummary) -> Unit
+    api: PrismoAPI, repos: List<RepoSummary>, refresh: Int,
+    open: (RepoSummary) -> Unit
 ) {
-    val statuses = remember(api) { mutableStateMapOf<String, RepoStatus>() }
-    val unavailable = remember(api) { mutableStateMapOf<String, Boolean>() }
+    val statuses = remember(api, refresh) { mutableStateMapOf<String, RepoStatus>() }
+    val unavailable = remember(api, refresh) { mutableStateMapOf<String, Boolean>() }
     val slots = remember(api) { Semaphore(2) }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Text("PC", fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
-        val device = Uri.parse(url).host.orEmpty().substringBefore(".")
-        Text(device.ifBlank { "PC" }, fontWeight = FontWeight.SemiBold)
+        Text("등록됨", fontWeight = FontWeight.SemiBold)
 
         Spacer(Modifier.height(16.dp))
         Text("저장소", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(repos, key = { it.id }) { repo ->
-                LaunchedEffect(api, repo.id) {
+                LaunchedEffect(api, repo.id, refresh) {
                     if (!statuses.containsKey(repo.id) && !unavailable.containsKey(repo.id)) {
                         try {
                             statuses[repo.id] = slots.withPermit { api.status(repo.id) }
@@ -403,11 +520,13 @@ private fun ChangesPage(
     api: PrismoAPI, id: String, refresh: Int,
     scroll: androidx.compose.foundation.lazy.LazyListState,
     collapsed: List<String>, onToggle: (String) -> Unit,
-    open: (String, String?) -> Unit
+    open: (String, String?, Boolean) -> Unit
 ) {
     var status by remember(id) { mutableStateOf<RepoStatus?>(null) }
     var error by remember(id) { mutableStateOf<String?>(null) }
+    var loading by remember(id) { mutableStateOf(false) }
     LaunchedEffect(api, id, refresh) {
+        loading = true
         error = null
         try {
             status = api.status(id)
@@ -415,33 +534,50 @@ private fun ChangesPage(
             throw exception
         } catch (_: Exception) {
             error = "변경 목록을 불러올 수 없습니다."
+        } finally {
+            loading = false
         }
     }
     Column(Modifier.fillMaxSize()) {
         ErrorText(error)
         val current = status
-        if (current == null && error == null) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (current == null && error == null) {
+            Row(Modifier.fillMaxWidth().padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(12.dp))
+                Text("PC에서 변경 목록을 불러오는 중…", fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
         if (current != null) {
+            if (loading) {
+                Text("변경 목록 새로고침 중…", modifier = Modifier.padding(horizontal = 16.dp),
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LinearProgressIndicator(Modifier.fillMaxWidth())
+            }
             GitChangesTree(current, scroll, collapsed, onToggle, open)
         }
     }
 }
 @Composable
-private fun HistoryPage(api: PrismoAPI, id: String, refresh: Int,
-                        open: (String, String) -> Unit) {
-    var commits by remember(id) { mutableStateOf<List<Commit>>(emptyList()) }
-    var cursor by remember(id) { mutableStateOf<String?>(null) }
-    var nextCursor by remember(id) { mutableStateOf<String?>(null) }
-    var loading by remember(id) { mutableStateOf(false) }
-    var selectedHash by remember(id) { mutableStateOf<String?>(null) }
-    var selectedFiles by remember(id) { mutableStateOf<Pair<String, List<String>>?>(null) }
-    var pageError by remember(id) { mutableStateOf<String?>(null) }
-    var fileError by remember(id) { mutableStateOf<String?>(null) }
-    var reload by remember(id) { mutableIntStateOf(0) }
-    var fileReload by remember(id) { mutableIntStateOf(0) }
-    var pageRequestId by remember(id) { mutableIntStateOf(0) }
-    var loadedRefresh by remember(id) { mutableIntStateOf(refresh) }
+private fun HistoryPage(api: PrismoAPI, id: String, refresh: Int, history: HistoryState,
+                        open: (String, String, Boolean) -> Unit) {
+    var commits by history.commits
+    var cursor by history.cursor
+    var nextCursor by history.nextCursor
+    var loading by history.loading
+    var selectedHash by history.selectedHash
+    var selectedFiles by history.selectedFiles
+    var pageError by history.pageError
+    var fileError by history.fileError
+    var reload by history.reload
+    var fileReload by history.fileReload
+    var pageRequestId by history.pageRequestId
+    var loadedPageRequestId by history.loadedPageRequestId
+    var loadedRefresh by history.loadedRefresh
     LaunchedEffect(api, id, refresh, reload, pageRequestId) {
+        if (loadedRefresh == refresh && loadedPageRequestId == pageRequestId) return@LaunchedEffect
         loading = true
         pageError = null
         val requestCursor = requestPageCursor(refresh, loadedRefresh, cursor)
@@ -451,9 +587,11 @@ private fun HistoryPage(api: PrismoAPI, id: String, refresh: Int,
             nextCursor = page.nextCursor
             cursor = requestCursor
             loadedRefresh = refresh
+            loadedPageRequestId = pageRequestId
             if (requestCursor == null) {
                 selectedHash = null
                 selectedFiles = null
+                fileError = null
             }
         } catch (e: CancellationException) { throw e }
         catch (e: HttpException) {
@@ -470,9 +608,13 @@ private fun HistoryPage(api: PrismoAPI, id: String, refresh: Int,
     }
     LaunchedEffect(api, id, selectedHash, fileReload) {
         val hash = selectedHash
+        if (hash != null && selectedFiles?.first == hash) return@LaunchedEffect
         fileError = null
+        selectedFiles = null
         if (hash != null) try {
-            selectedFiles = hash to api.commitFiles(id, hash).files
+            val listing = api.commitFiles(id, hash)
+            requireNotNull(listing.deletedFiles) { "Invalid commit files response" }
+            selectedFiles = hash to listing
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) {
             fileError = "커밋 파일을 불러올 수 없습니다."
@@ -488,7 +630,7 @@ private fun HistoryPage(api: PrismoAPI, id: String, refresh: Int,
         if (pageError != null && !loading) {
             OutlinedButton(onClick = { reload++ }) { Text("다시 불러오기") }
         }
-        LazyColumn {
+        LazyColumn(state = history.scroll) {
             items(commits, key = { it.hash }) { commit ->
                 HorizontalDivider()
                 Column(Modifier.fillMaxWidth().clickable {
@@ -508,11 +650,13 @@ private fun HistoryPage(api: PrismoAPI, id: String, refresh: Int,
                     if (selectedFiles?.first != commit.hash && fileError == null) {
                         LinearProgressIndicator(Modifier.fillMaxWidth())
                     }
-                    selectedFiles?.takeIf { it.first == commit.hash }?.second.orEmpty().forEach { path ->
-                        Text("  ↳ " + path, fontSize = 12.sp,
-                            modifier = Modifier.fillMaxWidth().clickable {
-                                open(path, commit.hash)
-                            }.padding(vertical = 8.dp, horizontal = 8.dp))
+                    selectedFiles?.takeIf { it.first == commit.hash }?.second?.let { changes ->
+                        changes.files.forEach { path ->
+                            Text("  ↳ " + path, fontSize = 12.sp,
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    open(path, commit.hash, path in changes.deletedFiles)
+                                }.padding(vertical = 8.dp, horizontal = 8.dp))
+                        }
                     }
                 }
             }
@@ -552,7 +696,7 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
             }
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) {
-            UpdateState.Failed
+            UpdateState.Failed("업데이트 정보를 확인할 수 없습니다.")
         }
     }
     val updateStatus = when (val current = updateState) {
@@ -560,7 +704,7 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         UpdateState.Unconfigured -> "업데이트 준비 전"
         UpdateState.NotPublished -> "업데이트 없음"
         UpdateState.Current -> "최신 버전"
-        UpdateState.Failed -> "업데이트할 수 없습니다."
+        is UpdateState.Failed -> current.message
         is UpdateState.Available -> "새 버전 " + current.info.versionName
         is UpdateState.PermissionRequired -> "설치 권한을 허용한 뒤 다시 눌러주세요."
         UpdateState.Downloading -> "다운로드 중"
@@ -569,6 +713,7 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
     val availableUpdate = when (val current = updateState) {
         is UpdateState.Available -> current.info
         is UpdateState.PermissionRequired -> current.info
+        is UpdateState.Failed -> current.info
         else -> null
     }
     var noticePath by remember { mutableStateOf<String?>(null) }
@@ -645,8 +790,14 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
                                 updateState = UpdateState.InstallPending
                                 AppUpdater.install(context, apk)
                             } catch (e: CancellationException) { throw e }
-                            catch (_: Exception) {
-                                updateState = UpdateState.Failed
+                            catch (e: Exception) {
+                                val reason = when (e) {
+                                    is IllegalArgumentException ->
+                                        e.message ?: "업데이트 파일을 검증하지 못했습니다."
+                                    is java.io.IOException -> "업데이트 파일을 다운로드하지 못했습니다."
+                                    else -> "업데이트를 완료하지 못했습니다."
+                                }
+                                updateState = UpdateState.Failed(reason, availableUpdate)
                             }
                         }
                     }
@@ -657,10 +808,7 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         }
         HorizontalDivider()
         Text("연결된 PC", style = MaterialTheme.typography.titleMedium)
-        Text(Uri.parse(prefs.pcURL).host.orEmpty().substringBefore(".").ifBlank { "PC" },
-            fontWeight = FontWeight.SemiBold)
-        Text(prefs.pcURL, fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("등록됨", fontWeight = FontWeight.SemiBold)
         HorizontalDivider()
         Text("오픈소스 라이선스", style = MaterialTheme.typography.titleMedium)
         OutlinedButton(onClick = { noticePath = "android-library-notices.txt" }) {
@@ -669,7 +817,7 @@ private fun SettingsPage(api: PrismoAPI, prefs: ViewerPreferences,
         OutlinedButton(onClick = { noticePath = "renderer-licenses.txt" }) {
             Text("Diff / 코드 렌더러 라이선스")
         }
-        OutlinedButton(onClick = { onPrefs { it.copy(pcURL = "", deviceToken = "") } }) {
+        OutlinedButton(onClick = { onPrefs { it.copy(pcID = "", deviceToken = "") } }) {
             Text("PC 연결 정보 삭제")
         }
     }
@@ -685,7 +833,7 @@ private fun SettingSwitch(label: String, checked: Boolean, onChanged: (Boolean) 
 @Composable
 private fun ReaderPage(
     api: PrismoAPI, id: String, target: ReaderTarget,
-    prefs: ViewerPreferences, onBack: () -> Unit
+    prefs: ViewerPreferences, refresh: Int, onBack: () -> Unit
 ) {
     val hasDiff = target.scope != null || target.commit != null
     val fileName = target.path.substringAfterLast("/")
@@ -706,22 +854,38 @@ private fun ReaderPage(
     var showFullPath by rememberSaveable(target.path) { mutableStateOf(false) }
     var mode by rememberSaveable(target) {
         mutableStateOf(when {
+            target.deleted && hasDiff -> "diff"
             imageFile -> "image"
             markdownFile -> "markdown"
             hasDiff -> "diff"
             else -> "file"
         })
     }
-    var result by remember(target, mode) { mutableStateOf<ReaderResult>(ReaderResult.Loading) }
+    val dataRevision = if (target.commit == null) refresh else 0
+    var result by remember(target, mode, dataRevision) {
+        mutableStateOf<ReaderResult>(ReaderResult.Loading)
+    }
     var retry by remember(target, mode) { mutableIntStateOf(0) }
-    LaunchedEffect(api, id, target, mode, retry, prefs.fullDiff) {
+    LaunchedEffect(api, id, target, mode, dataRevision, retry, prefs.fullDiff) {
         result = ReaderResult.Loading
         try {
             if (mode == "image") {
                 result = withContext(Dispatchers.IO) {
-                    val response = api.image(id, target.path,
+                    val call = api.image(id, target.path,
                         if (target.scope == "staged") "index" else null, target.commit)
-                    val bytes = response.use { it.bytes() }
+                    val cancellationWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                        try { awaitCancellation() } finally { call.cancel() }
+                    }
+                    val bytes = try {
+                        val response = call.execute()
+                        if (!response.isSuccessful) {
+                            response.errorBody()?.close()
+                            throw HttpException(response)
+                        }
+                        requireNotNull(response.body()) { "Empty image response" }.use { it.bytes() }
+                    } finally {
+                        cancellationWatcher.cancel()
+                    }
                     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
                     require(bounds.outWidth > 0 && bounds.outHeight > 0) {
@@ -800,8 +964,14 @@ private fun ReaderPage(
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier.padding(horizontal = 8.dp)) {
                 if (imageFile) {
-                    TextButton(onClick = { mode = "image" }) {
-                        Text(if (mode == "image") "● 이미지" else "이미지", fontSize = 12.sp)
+                    if (target.deleted) {
+                        TextButton(onClick = { mode = "diff" }) {
+                            Text("● 변경", fontSize = 12.sp)
+                        }
+                    } else {
+                        TextButton(onClick = { mode = "image" }) {
+                            Text(if (mode == "image") "● 이미지" else "이미지", fontSize = 12.sp)
+                        }
                     }
                 } else {
                     if (markdownFile) TextButton(onClick = { mode = "markdown" }) {
@@ -829,8 +999,11 @@ private fun ReaderPage(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 ReaderResult.Failed -> Column {
-                    ErrorText(if (imageFile) "이미지를 표시할 수 없습니다."
-                        else "파일을 읽을 수 없습니다.")
+                    ErrorText(when (mode) {
+                        "image" -> "이미지를 표시할 수 없습니다."
+                        "diff" -> "변경 내용을 불러올 수 없습니다."
+                        else -> "파일을 읽을 수 없습니다."
+                    })
                     OutlinedButton(onClick = { retry++ }) { Text("다시 시도") }
                 }
                 is ReaderResult.Picture -> Image(
