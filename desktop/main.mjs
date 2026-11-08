@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import QRCode from "qrcode";
 import electronUpdater from "electron-updater";
-import { findPairAddress } from "./connection.mjs";
+import { PrismoHost } from "./iroh.mjs";
+import { flushTransportLog, logTransportFailure } from "./transport-log.mjs";
 import { checkLatestGitHubRelease, createUpdateCheckGate } from "./update-check.mjs";
 import { createLoginStartup } from "./login-startup.mjs";
 
@@ -31,58 +32,79 @@ let pcUpdateState = { kind: "idle", message: "" };
 const updateCheck = createUpdateCheckGate();
 const loginStartup = createLoginStartup(app);
 const startedAtLogin = loginStartup.isStartupLaunch(process.argv);
-const PORT = 3000;
 const WINDOW_PAGE = pathToFileURL(join(here, "index.html")).href;
-const HEALTH_URL = "http://127.0.0.1:" + PORT + "/health";
 
 let window = null;
 let tray = null;
 let quitting = false;
 let shutdown = null;
 let server = null;
+let host = null;
 let serverError = "";
-let connectionCache = null;
-let cacheTime = 0;
-let privateConnectionCheck = null;
-let privateConnectionCheckedAt = 0;
-let privateConnectionReady = false;
+let agentOperation = Promise.resolve();
+function runAgentOperation(action) {
+  const operation = agentOperation.then(action);
+  agentOperation = operation.then(() => {}, () => {});
+  return operation;
+}
 const primary = app.requestSingleInstanceLock();
 if (!primary) app.quit();
 else app.on("second-instance", (_event, commandLine) => {
   if (!loginStartup.isStartupLaunch(commandLine)) showWindow();
 });
 
-async function health() {
-  try {
-    const response = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(1000) });
-    if (!response.ok) return false;
-    const value = await response.json();
-    return value.service === "Prismo" && value.status === "ok";
-  } catch { return false; }
+async function approveDevice(name, signal) {
+  if (signal.aborted || !window || window.isDestroyed()) return false;
+  showWindow();
+  const answer = await dialog.showMessageBox(window, {
+    type: "question", title: "새 기기 등록",
+    message: "이 기기를 등록할까요?", detail: name,
+    buttons: ["취소", "등록"], defaultId: 0, cancelId: 0, signal
+  });
+  return !signal.aborted && answer.response === 1;
 }
-async function startAgent() {
-  if (server) return true;
-  if (await health()) {
-    serverError = "서버가 다른 창에서 실행 중입니다.";
-    return false;
-  }
-  try {
-    const instance = createApp(pairing, updates, privateConnectionAvailable);
-    await instance.listen({ host: "127.0.0.1", port: PORT });
-    server = instance;
-    serverError = "";
-    return true;
-  } catch {
-    serverError = "서버를 시작할 수 없습니다.";
-    return false;
-  }
+
+function startAgent() {
+  return runAgentOperation(async () => {
+    if (shutdown || quitting) return false;
+    if (server) return true;
+    const instance = createApp(pairing, updates, approveDevice);
+    let endpoint = null;
+    try {
+      await instance.ready();
+      endpoint = new PrismoHost(instance, peerID => pairing.hasPeer(peerID));
+      await endpoint.start();
+      host = endpoint;
+      server = instance;
+      serverError = "";
+      return true;
+    } catch (error) {
+      if (endpoint) await endpoint.stop().catch(cause => {
+        logTransportFailure("startup-cleanup", cause);
+      });
+      await instance.close().catch(cause => {
+        logTransportFailure("agent-cleanup", cause);
+      });
+      logTransportFailure("startup", error);
+      serverError = "연결을 시작할 수 없습니다.";
+      return false;
+    }
+  });
 }
-async function stopAgent() {
-  pairing.cancel();
-  if (!server) return;
-  const instance = server;
-  server = null;
-  await instance.close();
+function stopAgent() {
+  return runAgentOperation(async () => {
+    pairing.cancel();
+    if (!server) return;
+    const instance = server;
+    const endpoint = host;
+    server = null;
+    host = null;
+    try {
+      if (endpoint) await endpoint.stop();
+    } finally {
+      await instance.close();
+    }
+  });
 }
 function showWindow() {
   if (!window || window.isDestroyed()) return;
@@ -92,7 +114,10 @@ function showWindow() {
 }
 function quitPrismo() {
   if (!shutdown) {
-    shutdown = stopAgent().catch(() => {}).finally(() => {
+    shutdown = stopAgent().catch(error => {
+      logTransportFailure("shutdown", error);
+    }).finally(async () => {
+      await flushTransportLog();
       quitting = true;
       app.quit();
     });
@@ -109,61 +134,8 @@ function createTray() {
   ]));
   tray.on("double-click", showWindow);
 }
-function tailscaleBinary() {
-  const paths = [
-    process.env.ProgramFiles && join(process.env.ProgramFiles, "Tailscale", "tailscale.exe"),
-    process.env["ProgramFiles(x86)"] && join(process.env["ProgramFiles(x86)"], "Tailscale", "tailscale.exe"),
-    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Tailscale", "tailscale.exe")
-  ].filter(Boolean);
-  return paths.find(path => existsSync(path)) ?? null;
-}
-async function tailscale(args) {
-  const executable = tailscaleBinary();
-  if (!executable) throw Error("Tailscale not installed");
-  return (await execute(executable, args, {
-    timeout: 9500, maxBuffer: 512 * 1024, windowsHide: true
-  })).stdout;
-}
-async function inspectConnection(force = false) {
-  const now = Date.now();
-  if (!force && connectionCache && now - cacheTime < 5000) return connectionCache;
-  let result = { ready: false, reason: "setup", address: null };
-  if (!tailscaleBinary()) {
-    result = { ready: false, reason: "install", address: null };
-  } else {
-    try {
-      const status = JSON.parse(await tailscale(["status", "--json"]));
-      if (status.BackendState !== "Running") {
-        result = { ready: false, reason: "login", address: null };
-      } else {
-        const serve = JSON.parse(await tailscale(["serve", "status", "--json"]));
-        const address = findPairAddress(status, serve);
-        if (address) result = { ready: true, reason: "", address };
-      }
-    } catch {
-      result = { ready: false, reason: "setup", address: null };
-    }
-  }
-  connectionCache = result;
-  cacheTime = now;
-  return result;
-}
-
-function privateConnectionAvailable() {
-  if (privateConnectionCheck) return privateConnectionCheck;
-  if (Date.now() - privateConnectionCheckedAt < 1000) {
-    return Promise.resolve(privateConnectionReady);
-  }
-  privateConnectionCheck = inspectConnection(true)
-    .then(connection => connection.ready)
-    .catch(() => false)
-    .then(ready => {
-      privateConnectionReady = ready;
-      privateConnectionCheckedAt = Date.now();
-      return ready;
-    })
-    .finally(() => { privateConnectionCheck = null; });
-  return privateConnectionCheck;
+function connectionState() {
+  return { ready: Boolean(host), pcID: host?.id ?? null };
 }
 
 function sendUpdateStatus(kind, message) {
@@ -260,24 +232,25 @@ async function checkPCUpdate(automatic = false) {
       }
     });
   }
-  return updateCheck.run(async () => {
+  await updateCheck.run(async () => {
     sendUpdateStatus("checking", "업데이트 확인 중");
     try {
       await autoUpdater.checkForUpdates();
     } catch {
       sendUpdateStatus("error", "업데이트 확인 실패");
     }
-    return pcUpdateState;
   });
+  return pcUpdateState;
 }
 
 let previousQR = null;
 function pairingLink(connection, pending) {
-  return connection.address + "/#pair=" + encodeURIComponent(pending.secret);
+  return "prismo://pair?v=1&pc=" + encodeURIComponent(connection.pcID) +
+    "&code=" + encodeURIComponent(pending.secret);
 }
 async function pairingState() {
   const running = Boolean(server);
-  const connection = await inspectConnection();
+  const connection = connectionState();
   if (!running || !connection.ready) pairing.cancel();
   const pending = running && connection.ready ? pairing.current() : null;
   if (!pending) previousQR = null;
@@ -289,8 +262,9 @@ async function pairingState() {
   if (pending && qr) previousQR = { secret: pending.secret, image: qr };
   return {
     running, serverError, connection,
-    pairing: pending ? { active: true, expiresAt: pending.expiresAt, qr } : { active: false },
-    connectedDevices: pairing.count()
+    pairing: pending ? { active: true, expiresAt: pending.expiresAt, qr,
+      link: pairingLink(connection, pending) } : { active: false },
+    connectedDevices: pairing.count(), devices: pairing.list(host?.onlinePeers())
   };
 }
 async function snapshot() {
@@ -346,35 +320,8 @@ function registerHandlers() {
     }
     return snapshot();
   });
-  handle("prismo:setup-connection", async () => {
-    const connection = await inspectConnection(true);
-    if (connection.reason === "install") {
-      await shell.openExternal("https://tailscale.com/download/windows");
-      return snapshot();
-    }
-    if (connection.reason === "login") {
-      // Opens the interactive login flow in the system browser.
-      try { await tailscale(["up"]); } catch { /* Login may require user interaction. */ }
-      return snapshot();
-    }
-    if (!connection.ready) {
-      try {
-        await tailscale(["serve", "--bg", "3000"]);
-      } catch (error) {
-        const output = String(error?.stdout ?? "") + "\n" + String(error?.stderr ?? "");
-        const approvalURL = output.match(/https:\/\/login\.tailscale\.com\/f\/serve\?node=[^\s]+/)?.[0];
-        if (approvalURL) {
-          await shell.openExternal(approvalURL);
-        } else {
-          throw Error("연결 설정을 완료할 수 없습니다.");
-        }
-      }
-    }
-    await inspectConnection(true);
-    return snapshot();
-  });
   handle("prismo:copy-pairing-link", async () => {
-    const connection = await inspectConnection(true);
+    const connection = connectionState();
     const pending = pairing.current();
     if (!server || !connection.ready || !pending) {
       throw Error("연결 코드가 없습니다.");
@@ -384,7 +331,7 @@ function registerHandlers() {
   });
   handle("prismo:begin-pairing", async () => {
     if (!server) throw Error("서버를 먼저 시작하세요.");
-    const connection = await inspectConnection(true);
+    const connection = connectionState();
     if (!connection.ready) throw Error("연결 설정을 완료하세요.");
     pairing.issue();
     return pairingState();
@@ -393,13 +340,17 @@ function registerHandlers() {
     pairing.cancel();
     return pairingState();
   });
-  handle("prismo:revoke-devices", async () => {
+  handle("prismo:revoke-device", async (_event, id) => {
+    if (!pairing.list().some(device => device.id === id)) throw Error("기기를 찾을 수 없습니다.");
     const answer = await dialog.showMessageBox(window, {
-      type: "warning", title: "기기 연결 해제",
-      buttons: ["취소", "모두 해제"], defaultId: 0, cancelId: 0,
-      message: "연결된 기기를 모두 해제할까요?"
+      title: "기기 연결 해제", message: "이 기기의 연결을 해제할까요?",
+      buttons: ["취소", "해제"], defaultId: 0, cancelId: 0
     });
-    if (answer.response === 1) await pairing.revokeAll();
+    if (answer.response === 1) {
+      const peerID = pairing.peerID(id);
+      await pairing.revoke(id);
+      if (peerID) await host?.disconnectPeer(peerID);
+    }
     return pairingState();
   });
 }

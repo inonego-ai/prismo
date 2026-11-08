@@ -37,28 +37,22 @@
       <div class="section-head">
         <div class="head-title">
           <img class="section-icon" src="./icons/smartphone.svg" alt=""/>
-          <h1 id="pair-heading">기기 연결</h1>
+          <h1 id="pair-heading">연결된 기기</h1>
+          <span class="count" id="devices-count">0</span>
         </div>
         <span class="status-chip" id="connection-status">확인 중</span>
       </div>
-      <div class="connect-content">
-        <div id="pair-placeholder" class="pair-placeholder">
-          <div class="placeholder-icon"><img src="./icons/qr-code.svg" alt=""/></div>
-          <p id="pair-message">연결 준비 중</p>
-        </div>
+      <div class="device-list" id="device-list">
+        <div class="repo-empty">등록된 기기 없음</div>
       </div>
       <div class="pair-footer">
         <button id="pair-button" class="btn primary" type="button" disabled>
           <img src="./icons/qr-code.svg" alt=""/>
-          <span id="pair-label">연결 설정</span>
+          <span id="pair-label">새 기기 등록</span>
         </button>
         <button id="refresh-button" class="icon-button" type="button" aria-label="새로고침" title="새로고침">
           <img src="./icons/refresh-cw.svg" alt=""/>
         </button>
-      </div>
-      <div class="connected-row">
-        <span id="devices-count">연결된 기기 0대</span>
-        <button id="revoke-button" class="subtle" type="button" hidden>연결 해제</button>
       </div>
     </section>
     <section class="surface repo-panel" aria-labelledby="repo-heading">
@@ -68,18 +62,22 @@
           <h2 id="repo-heading">저장소</h2>
           <span class="count" id="repo-count">0</span>
         </div>
-        <button id="add-button" class="btn outline" type="button">
-          <img src="./icons/plus.svg" alt=""/> 추가
-        </button>
+
       </div>
       <div class="repo-list" id="repository-list">
         <div class="repo-empty">등록된 저장소 없음</div>
       </div>
+      <div class="repo-footer">
+        <button id="add-button" class="btn outline" type="button">
+          <img src="./icons/plus.svg" alt=""/> 저장소 추가
+        </button>
+      </div>
     </section>
   </main>
-  <dialog id="pair-active" class="qr-dialog" aria-label="기기 연결 QR">
-    <div class="qr-dialog-header">기기 연결</div>
+  <dialog id="pair-active" class="qr-dialog" aria-label="새 기기 등록">
+    <div class="qr-dialog-header">새 기기 등록</div>
     <div class="qr-border"><img id="qr-image" alt="일회용 연결 QR 코드"/></div>
+    <input id="pair-link" class="pair-link" type="text" readonly aria-label="연결 주소"/>
     <div class="qr-meta">
       <span><img class="small-icon" src="./icons/clock-3.svg" alt=""/> <span id="countdown">02:00</span></span>
       <span class="qr-actions">

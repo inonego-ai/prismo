@@ -20,8 +20,9 @@ android {
         applicationId = "dev.prismo.app"
         minSdk = 28
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.1.0"
+        versionCode = 10
+        versionName = "0.2.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     if (hasReleaseSigning) {
         signingConfigs {
@@ -44,6 +45,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     buildFeatures { compose = true }
+    packaging {
+        resources {
+            // Iroh's JVM artifacts carry desktop natives that Android cannot load.
+            excludes += setOf("win32-x86-64/**", "darwin-aarch64/**")
+        }
+    }
 }
 kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 val bundleRenderer by tasks.registering(Exec::class) {
@@ -110,7 +117,13 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("computer.iroh:iroh-android:1.2.0") {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
+    implementation("net.java.dev.jna:jna:5.15.0@aar")
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

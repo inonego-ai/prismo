@@ -1,6 +1,6 @@
 # Prismo — 오픈소스 및 외부 SDK 라이선스 관리
 
-> 2026-11-05 기준. 현재 잠금 파일과 Android 빌드 구성을 확인한 결과이며 법률 자문은 아니다.
+> 2026-11-06 기준. 현재 잠금 파일과 Android 빌드 구성을 확인한 결과이며 법률 자문은 아니다.
 > 이 문서는 프로젝트 배포에 필요한 라이선스 정보와 확인 범위를 기록한다.
 
 ## 1. 배포 구성에 따라 구분
@@ -9,7 +9,7 @@
   WebView용 JavaScript 번들(diff2html 파서, highlight.js, DOMPurify, marked).
 - **Windows PC 프로그램에서 사용:** Fastify, qrcode, Electron, Lucide SVG 아이콘 등. 이들을 설치하거나
   PC Agent를 번들 배포하는 경우 해당 패키지들의 라이선스 고지를 지켜야 한다.
-- **외부 설치 도구:** Git CLI(GPL), Tailscale(BSD-3-Clause 코드 및 서비스 약관), Node.js, Android SDK,
+- **외부 설치 도구:** Git CLI(GPL), Node.js, Android SDK,
   JDK, Gradle 등은 현재 Prismo APK/Windows 앱 바이너리에 함께 넣어 배포하지 않는다.
 - **Prismo 원본 소스:** [MIT License](../LICENSE). 제3자 구성요소에는 각각의 라이선스가 적용된다.
 
@@ -41,6 +41,8 @@
 | Jetpack Compose / AndroidX | Compose BOM 2025.10.00 및 기타 AndroidX | 일반적으로 Apache-2.0; 개별 POM 확인 |
 | Retrofit | 2.11.0 | Apache-2.0 |
 | OkHttp | 4.12.0 | Apache-2.0 |
+| Iroh Android FFI AAR (`computer.iroh:iroh-android`) | 1.2.0 | MIT OR Apache-2.0 |
+| JNA Android AAR | 5.15.0 | LGPL-2.1 OR Apache-2.0 |
 | Retrofit Gson Converter / Gson | Converter 2.11.0 / Gson 2.10.1 (Gradle 해석 결과) | Apache-2.0 |
 | Google Code Scanner | play-services-code-scanner 16.1.0 | Google Play services SDK 약관 및 포함된 OSS 고지 |
 | Android OSS 라이선스 고지 | docs/ANDROID_LIBRARY_NOTICES.txt | APK에 수록되는 직접 관리 고지(임시 수집 보완) |
@@ -67,6 +69,7 @@
 | --- | --- | --- | --- |
 | electron | 42.11.16 | MIT (Chromium 관련 고지 별도) | Windows GUI 런타임 |
 | qrcode | 1.5.4 | MIT | PC GUI에서 QR 생성 |
+| @number0/iroh 및 Windows 네이티브 모듈 | 1.2.0 | MIT OR Apache-2.0 | QUIC P2P·릴레이 전송 |
 | Lucide SVG 정적 아이콘 | 원본 1.67.0 | ISC (일부 Feather 유래 아이콘 MIT) | PC GUI에 포함한 SVG 자산. 설치 의존성은 없음 |
 | electron-builder | 26.18.0 | MIT | Windows 패키징(개발 도구) |
 | electron-updater | 6.8.11 | MIT | GitHub Releases Windows 설치형 업데이트 |
@@ -85,8 +88,7 @@
 
 - **Git CLI:** Git은 GPLv2 계열. Prismo는 외부 설치된 Git 명령을 프로세스로 호출하고,
   Git 자체를 수정·번들·재배포하지 않는다. 이 사용만으로 Prismo 소스를 GPL로 배포해야 한다고 단정하지 않는다.
-- **Tailscale:** 오픈소스 클라이언트 코드는 BSD-3-Clause이나, 설치 앱 사용 및 서비스 운영에는
-  별도 서비스 약관/구독 조건이 있다. Prismo는 Tailscale 코드 자체를 APK에 포함하지 않는다.
+- **Iroh:** Windows의 Node.js 네이티브 모듈과 Android Maven 라이브러리를 앱에 포함한다. MIT 또는 Apache-2.0 선택 조건, 관련 저작권·고지를 배포물에서 확인한다. 기본 릴레이·탐색 인프라는 코드 라이선스와 별개의 서비스 운영 조건이 적용될 수 있다.
 - **Android SDK/Build Tools:** 앱을 빌드하는 도구이며, Android SDK 사용권 계약이 적용된다.
   SDK를 APK에 재배포하지 않는다.
 - **Prismo LICENSE:** MIT License. 제3자 구성요소의 별도 고지와 조건은 유지해야 한다.
@@ -100,6 +102,7 @@
 - [ ] 설정 화면의 두 라이선스 페이지를 실제 삼성폰에서 확인
 - [ ] Apache-2.0 컴포넌트의 NOTICE 및 수정 여부 확인, 필요 시 고지 추가
 - [ ] PC Agent를 번들링할 경우 모든 포함된 npm 패키지의 라이선스 파일과 저작권 고지 유지
+- [ ] 최종 EXE·APK의 의존성 및 고지를 대조한 뒤 GitHub Actions 변수 `PRISMO_LICENSE_REVIEWED_SHA`를 해당 릴리스 커밋 SHA로 설정 (일치하지 않으면 게시 차단)
 - [ ] 앱 자체의 민감정보/로컬 소스코드 접근 정책과 개인정보 고지 점검
 
 최신 라이브러리 버전을 실제로 반영하는 경우 이 문서의 확인 버전도 함께 갱신한다.

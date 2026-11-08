@@ -8,9 +8,9 @@ import { UpdateStore } from "../updates.js";
 test("oversized release manifest cancels its source", async () => {
   const base = await mkdtemp(join(tmpdir(), "prismo-manifest-"));
   const config = join(base, "release.json");
-  const prefix = "https://github.com/example/prismo/releases/download/v0.1.1/";
+  const prefix = "https://github.com/example/prismo/releases/download/v0.2.0/";
   const release = {
-    tag_name: "v0.1.1", draft: false, prerelease: false, assets: [
+    tag_name: "v0.2.0", draft: false, prerelease: false, assets: [
       { name: "prismo-update.json", size: 10, state: "uploaded", digest: null,
         browser_download_url: prefix + "prismo-update.json" },
       { name: "app-release.apk", size: 3, state: "uploaded",
@@ -59,8 +59,8 @@ test("missing release responses cancel unread bodies", async () => {
 test("manifest download failures cancel unread streams", async () => {
   const base = await mkdtemp(join(tmpdir(), "prismo-release-error-"));
   const config = join(base, "release.json");
-  const prefix = "https://github.com/example/prismo/releases/download/v0.1.1/";
-  const release = { tag_name: "v0.1.1", draft: false, prerelease: false,
+  const prefix = "https://github.com/example/prismo/releases/download/v0.2.0/";
+  const release = { tag_name: "v0.2.0", draft: false, prerelease: false,
     assets: [
       { name: "prismo-update.json", size: 10, state: "uploaded", digest: null,
         browser_download_url: prefix + "prismo-update.json" },

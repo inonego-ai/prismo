@@ -15,9 +15,8 @@ contextBridge.exposeInMainWorld("prismo", Object.freeze({
   stopServer: () => ipcRenderer.invoke("prismo:stop-server"),
   addRepository: () => ipcRenderer.invoke("prismo:add-repository"),
   removeRepository: id => ipcRenderer.invoke("prismo:remove-repository", id),
-  setupConnection: () => ipcRenderer.invoke("prismo:setup-connection"),
   beginPairing: () => ipcRenderer.invoke("prismo:begin-pairing"),
   copyPairingLink: () => ipcRenderer.invoke("prismo:copy-pairing-link"),
   cancelPairing: () => ipcRenderer.invoke("prismo:cancel-pairing"),
-  revokeDevices: () => ipcRenderer.invoke("prismo:revoke-devices")
+  revokeDevice: id => ipcRenderer.invoke("prismo:revoke-device", id)
 }));

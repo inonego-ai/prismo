@@ -10,21 +10,23 @@ import { UpdateStore } from "../updates.js";
 import { createApp } from "../api.js";
 
 const hash = (data: Buffer) => createHash("sha256").update(data).digest("hex");
+const TEST_PEER = "a".repeat(64);
+const TEST_TOKEN = "A".repeat(43);
 
 test("real UpdateStore forwards client cancellation to the GitHub APK fetch", async () => {
   const base = await mkdtemp(join(tmpdir(), "prismo-fetch-abort-"));
   const config = join(base, "release.json");
   const apk = Buffer.from("apk");
   const manifest = Buffer.from(JSON.stringify({
-    packageName: "dev.prismo.app", versionCode: 2, versionName: "0.1.1",
+    packageName: "dev.prismo.app", versionCode: 7, versionName: "0.2.0",
     apk: "app-release.apk", size: apk.length, sha256: hash(apk)
   }));
-  const releaseURL = "https://github.com/example/prismo/releases/download/v0.1.1/";
+  const releaseURL = "https://github.com/example/prismo/releases/download/v0.2.0/";
   const asset = (name: string, content: Buffer) => ({
     name, state: "uploaded", size: content.length, digest: "sha256:" + hash(content),
     browser_download_url: releaseURL + name
   });
-  const release = { tag_name: "v0.1.1", draft: false, prerelease: false,
+  const release = { tag_name: "v0.2.0", draft: false, prerelease: false,
     assets: [asset("prismo-update.json", manifest), asset("app-release.apk", apk)] };
   let started!: () => void;
   const requested = new Promise<void>(resolve => { started = resolve; });
@@ -65,16 +67,17 @@ test("Fastify request errors retain their client status codes", async () => {
     new UpdateStore(), async () => true);
   try {
     const url = "/api/v1/pair";
+    const peerID = "c".repeat(64);
     const malformed = await app.inject({
-      method: "POST", url, headers: { "content-type": "application/json" }, payload: "{"
+      method: "POST", url, headers: { "content-type": "application/json", "x-prismo-peer": peerID }, payload: "{"
     });
     assert.equal(malformed.statusCode, 400);
     const oversized = await app.inject({
-      method: "POST", url, payload: { code: "a".repeat(2048) }
+      method: "POST", url, headers: { "x-prismo-peer": peerID }, payload: { code: "a".repeat(2048) }
     });
     assert.equal(oversized.statusCode, 413);
     const unsupported = await app.inject({
-      method: "POST", url, headers: { "content-type": "application/xml" }, payload: "<x/>"
+      method: "POST", url, headers: { "content-type": "application/xml", "x-prismo-peer": peerID }, payload: "<x/>"
     });
     assert.equal(unsupported.statusCode, 415);
   } finally {
@@ -107,11 +110,12 @@ test("client disconnect cancels an outstanding APK fetch", async () => {
   try {
     const code = pairing.issue().secret;
     const paired = await app.inject({
-      method: "POST", url: "/api/v1/pair", payload: { code }
+      method: "POST", url: "/api/v1/pair", payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER }
     });
+    assert.equal(paired.statusCode, 200);
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
     const request = fetch(address + "/api/v1/app/update/download", {
-      headers: { authorization: "Bearer " + paired.json().token },
+      headers: { authorization: "Bearer " + TEST_TOKEN, "x-prismo-peer": TEST_PEER },
       signal: client.signal
     });
     await startedPromise;
@@ -129,7 +133,7 @@ test("malformed GitHub release assets are rejected without crashing update looku
   const base = await mkdtemp(join(tmpdir(), "prismo-malformed-release-"));
   const config = join(base, "release.json");
   const fetcher: typeof fetch = async () => new Response(JSON.stringify({
-    tag_name: "v0.1.1", draft: false, prerelease: false, assets: [null]
+    tag_name: "v0.2.0", draft: false, prerelease: false, assets: [null]
   }));
   try {
     await writeFile(config, JSON.stringify({ github: { owner: "example", repo: "prismo" } }));
@@ -203,8 +207,8 @@ test("authenticated APK transfers are bounded until response streams close", asy
     if (++started === 2) twoStarted();
     await gate;
     return {
-      update: { packageName: "dev.prismo.app", versionCode: 2,
-        versionName: "0.1.1", size: 3, sha256: hash(Buffer.from("apk")) },
+      update: { packageName: "dev.prismo.app", versionCode: 7,
+        versionName: "0.2.0", size: 3, sha256: hash(Buffer.from("apk")) },
       stream: Readable.from([Buffer.from("apk")])
     };
   };
@@ -213,10 +217,10 @@ test("authenticated APK transfers are bounded until response streams close", asy
   try {
     const code = pairing.issue().secret;
     const paired = await app.inject({
-      method: "POST", url: "/api/v1/pair", payload: { code }
+      method: "POST", url: "/api/v1/pair", payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER }
     });
     assert.equal(paired.statusCode, 200);
-    const headers = { authorization: "Bearer " + paired.json().token };
+    const headers = { authorization: "Bearer " + TEST_TOKEN, "x-prismo-peer": TEST_PEER };
     const request = { method: "GET" as const,
       url: "/api/v1/app/update/download", headers };
     const first = app.inject(request);
@@ -242,7 +246,7 @@ test("server shutdown closes an in-progress APK stream", async () => {
   const updates = new UpdateStore(join(base, "release.json"));
   const stream = new PassThrough();
   updates.download = async () => ({
-    update: { packageName: "dev.prismo.app", versionCode: 2, versionName: "0.1.1",
+    update: { packageName: "dev.prismo.app", versionCode: 7, versionName: "0.2.0",
       size: 100, sha256: hash(Buffer.from("apk")) },
     stream
   });
@@ -251,12 +255,12 @@ test("server shutdown closes an in-progress APK stream", async () => {
   try {
     const code = pairing.issue().secret;
     const paired = await app.inject({
-      method: "POST", url: "/api/v1/pair", payload: { code }
+      method: "POST", url: "/api/v1/pair", payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER }
     });
     assert.equal(paired.statusCode, 200);
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
     const request = fetch(address + "/api/v1/app/update/download", {
-      headers: { authorization: "Bearer " + paired.json().token },
+      headers: { authorization: "Bearer " + TEST_TOKEN, "x-prismo-peer": TEST_PEER },
       signal: AbortSignal.timeout(5000)
     });
     stream.write(Buffer.from("a"));
@@ -285,7 +289,7 @@ test("only paired clients can retrieve the newest published release", async () =
     await readFile(new URL("../../package.json", import.meta.url), "utf8")
   ) as { version: string };
   const manifest = Buffer.from(JSON.stringify({
-    packageName: "dev.prismo.app", versionCode: 1, versionName,
+    packageName: "dev.prismo.app", versionCode: 7, versionName,
     apk: "app-release.apk", size: apk.length, sha256: hash(apk)
   }));
   const urlBase = `https://github.com/example/prismo/releases/download/v${versionName}/`;
@@ -314,7 +318,7 @@ test("only paired clients can retrieve the newest published release", async () =
     return new Response("Not found", { status: 404 });
   };
   await writeFile(config, JSON.stringify({ github: { owner: "example", repo: "prismo" } }));
-  const pairing = new PairingStore(join(root, "paired-devices.json"));
+  const pairing = new PairingStore(join(root, "paired-endpoints.json"));
   const updates = new UpdateStore(config, mockFetch);
   const app = createApp(pairing, updates, async () => true);
   try {
@@ -322,9 +326,11 @@ test("only paired clients can retrieve the newest published release", async () =
     assert.equal(unauth.statusCode, 401);
     const code = pairing.issue().secret;
     const response = await app.inject({
-      method: "POST", url: "/api/v1/pair", payload: { code }
+      method: "POST", url: "/api/v1/pair", payload: { code, token: TEST_TOKEN }, headers: { "x-prismo-peer": TEST_PEER }
     });
-    const headers = { authorization: "Bearer " + response.json().token };
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().paired, true);
+    const headers = { authorization: "Bearer " + TEST_TOKEN, "x-prismo-peer": TEST_PEER };
     const current = await app.inject({
       method: "GET", url: "/api/v1/app/update", headers
     });

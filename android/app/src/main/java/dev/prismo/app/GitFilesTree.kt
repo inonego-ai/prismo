@@ -20,6 +20,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -79,30 +81,41 @@ internal fun fileRows(
     return output
 }
 
+internal class FileTreeState {
+    val pages = mutableStateMapOf<String, List<TreeEntry>>()
+    val cursors = mutableStateMapOf<String, String?>()
+    val failedFolders = mutableStateMapOf<String, Boolean>()
+    var error by mutableStateOf<String?>(null)
+}
+
 @Composable
 internal fun GitFilesTree(
     api: PrismoAPI,
     id: String,
     refresh: Int,
+    state: FileTreeState,
     scroll: LazyListState,
     expanded: List<String>,
     onToggle: (String) -> Unit,
     open: (String) -> Unit
 ) {
-    val pages = remember(id, refresh) { mutableStateMapOf<String, List<TreeEntry>>() }
-    val cursors = remember(id, refresh) { mutableStateMapOf<String, String?>() }
-    val loadingFolders = remember(id, refresh) { mutableStateMapOf<String, Boolean>() }
-    val failedFolders = remember(id, refresh) { mutableStateMapOf<String, Boolean>() }
+    val pages = state.pages
+    val cursors = state.cursors
+    val failedFolders = state.failedFolders
+    val loadingFolders = remember(api, id, refresh) { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
+    val requestJob = remember(api, id, refresh) { SupervisorJob(scope.coroutineContext[Job]) }
+    DisposableEffect(requestJob) {
+        onDispose { requestJob.cancel() }
+    }
     val concurrency = remember(id, refresh) { Semaphore(4) }
     var retry by remember(id, refresh) { mutableIntStateOf(0) }
-    var error by remember(id, refresh) { mutableStateOf<String?>(null) }
 
     fun loadFolder(folder: String, more: Boolean = false) {
         if (loadingFolders.containsKey(folder) || (!more && pages.containsKey(folder))) return
         if (more && cursors[folder] == null) return
         loadingFolders[folder] = true
-        scope.launch {
+        scope.launch(requestJob) {
             try {
                 concurrency.withPermit {
                     val cursor = if (more) cursors[folder] else null
@@ -120,12 +133,12 @@ internal fun GitFilesTree(
                     cursors[folder] = page.nextCursor
                 }
                 failedFolders.remove(folder)
-                error = if (failedFolders.isNotEmpty()) "일부 폴더를 불러오지 못했습니다." else null
+                state.error = if (failedFolders.isNotEmpty()) "일부 폴더를 불러오지 못했습니다." else null
             } catch (exception: CancellationException) {
                 throw exception
             } catch (_: Exception) {
                 failedFolders[folder] = true
-                error = "일부 폴더를 불러오지 못했습니다."
+                state.error = "일부 폴더를 불러오지 못했습니다."
             } finally {
                 loadingFolders.remove(folder)
             }
@@ -138,20 +151,36 @@ internal fun GitFilesTree(
         .filter { it.item.directory && it.item.path in expandedSet }
         .map { it.item.path }
 
-    LaunchedEffect(api, id, refresh, visibleFolders, retry) {
+    LaunchedEffect(api, id, refresh, visibleFolders) {
         loadFolder("")
         for (folder in visibleFolders) loadFolder(folder)
+    }
+    LaunchedEffect(api, id, refresh, retry) {
+        if (retry > 0) {
+            for (folder in failedFolders.keys.toList()) {
+                loadFolder(folder, more = pages.containsKey(folder) && cursors[folder] != null)
+            }
+        }
     }
     Column(Modifier.fillMaxSize()) {
         Text("파일 탐색기", style = MaterialTheme.typography.titleMedium,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp))
-        if (error != null) {
-            Text(error.orEmpty(), modifier = Modifier.padding(horizontal = 12.dp),
+        if (state.error != null) {
+            Text(state.error.orEmpty(), modifier = Modifier.padding(horizontal = 12.dp),
                 color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
             TextButton(onClick = { retry++ }) { Text("다시 시도") }
         }
         if (loadingFolders.isNotEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth())
         LazyColumn(state = scroll, contentPadding = PaddingValues(bottom = 20.dp)) {
+            if (!pages.containsKey("") && !failedFolders.containsKey("")) item {
+                Row(Modifier.fillMaxWidth().padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text("PC에서 파일 목록을 불러오는 중…", fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
             items(rows, key = { it.key }) { row ->
                 val entry = (row as? FileTreeRow.Entry)?.item
                 val isFolder = entry?.directory == true
@@ -208,7 +237,8 @@ internal fun GitFilesTree(
                             else MaterialTheme.colorScheme.onSurface)
                 }
             }
-            if (rows.isEmpty() && loadingFolders.isEmpty() && error == null) item {
+            if (rows.isEmpty() && pages.containsKey("") &&
+                loadingFolders.isEmpty() && state.error == null) item {
                 Text("파일이 없습니다.", modifier = Modifier.padding(16.dp),
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

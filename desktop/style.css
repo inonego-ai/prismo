@@ -53,22 +53,19 @@ h1,h2 {font-size:13px;font-weight:600;margin:0;letter-spacing:-.01em;white-space
 .subtle {border:0;background:transparent;color:#929292;padding:5px;font-size:11px;}
 .subtle:hover:not(:disabled) {color:#f4f4f4;}
 .pair-panel {display:flex;flex-direction:column;height:100%;min-height:0;}
-.connect-content {flex:1 1 auto;min-height:0;display:grid;place-items:center;padding:10px;}
-.pair-placeholder {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;min-height:0;}
-.placeholder-icon {width:44px;height:44px;display:grid;place-items:center;border:1px solid #2c2c2c;border-radius:11px;background:#171717;}
-.placeholder-icon img {width:21px;height:21px;filter:brightness(0) invert(.52);}
-.pair-placeholder p {margin:0;color:var(--muted);font-size:11px;}
+.device-list {min-height:0;flex:1 1 auto;overflow-y:auto;}
 .qr-dialog {width:288px;max-width:calc(100vw - 32px);padding:18px;background:#141414;color:var(--text);border:1px solid #3b3b3b;border-radius:11px;box-shadow:0 18px 60px #0009;text-align:center;}
 .qr-dialog::backdrop {background:rgba(0,0,0,.78);}
 .qr-dialog-header {font-weight:620;font-size:13px;margin:0 0 14px;}
 .qr-border {padding:7px;background:white;border-radius:8px;display:inline-block;}
 #qr-image {width:184px;height:184px;display:block;}
+.pair-link {width:100%;height:28px;margin-top:9px;padding:0 8px;color:var(--soft);background:var(--control);border:1px solid var(--control-border);border-radius:var(--radius-control);font:inherit;font-size:10px;}
 .qr-meta {display:flex;justify-content:space-between;width:198px;margin:9px auto 0;align-items:center;color:#b9b9b9;font-size:11px;}
 .qr-meta>span {display:flex;gap:6px;align-items:center;}
 .qr-meta .qr-actions {gap:4px;}
 .small-icon {width:13px;height:13px;filter:brightness(0) invert(.65);}
-.pair-footer {display:flex;justify-content:center;gap:4px;padding:0 12px 10px;}
-.connected-row {height:37px;margin:0 16px;border-top:1px solid var(--divider);display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#888;}
+.pair-footer, .repo-footer {display:flex;align-items:center;justify-content:center;gap:4px;padding:9px 12px;min-height:52px;border-top:1px solid var(--divider);flex-shrink:0;}
+.pair-footer .btn, .repo-footer .btn {flex:1;}
 .repo-panel {display:flex;flex-direction:column;height:100%;min-height:0;}
 .repo-list {min-height:0;flex:1;overflow-y:auto;}
 .repo-empty {height:100%;min-height:0;display:grid;place-items:center;color:#707070;font-size:11px;}
